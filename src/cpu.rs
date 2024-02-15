@@ -101,6 +101,7 @@ impl CPUInfo {
     }
 }
 
+#[derive(Copy, Clone)]
 pub enum ValueSize {
     HALF,
     WORD,
@@ -413,10 +414,13 @@ fn read_instruction_data(instruction_pointer: usize, memory_map: &[MemoryMapSegm
     Ok(instruction_data)
 }
 
-pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory_map: &mut [MemoryMapSegment]) -> Result<CPUState, &'static str> {
+pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory_map: &mut [MemoryMapSegment]) -> Result<CPUState, String> {
+    // instruction_data is assumed to be contiguous since data is never added to it after read_instruction_data returns
     let mut instruction_data = read_instruction_data(cpu_state.instruction_pointer, memory_map).unwrap();
+    assert_eq!(instruction_data.as_slices().1.len(), 0, "instruction_data should be contiguous");
+
     if instruction_data.len() < 1 {
-        return Err(format!("No data at address {}", cpu_state.instruction_pointer).leak())
+        return Err(format!("No data at address {}", cpu_state.instruction_pointer))
     }
 
     let mut instruction_size = 0usize;
@@ -436,7 +440,7 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory_map: &mut [Memor
     }
 
     if instruction_data.len() < 1 {
-        return Err(format!("No data at address {}", cpu_state.instruction_pointer).leak())
+        return Err(format!("No data at address {}", cpu_state.instruction_pointer))
     }
 
     let prefix = instruction_data[0];
@@ -453,7 +457,7 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory_map: &mut [Memor
     // check for single byte NOP
 
     if instruction_data.len() < 1 {
-        return Err(format!("No data at address {}", cpu_state.instruction_pointer).leak())
+        return Err(format!("No data at address {}", cpu_state.instruction_pointer))
     }
 
     // there is technically nothing preventing this from being implemented without a VWI extension
@@ -463,7 +467,7 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory_map: &mut [Memor
     }
 
     if instruction_data.len() < 2 {
-        return Err(format!("No data at address {}", cpu_state.instruction_pointer).leak())
+        return Err(format!("No data at address {}", cpu_state.instruction_pointer))
     }
 
     // check for base-isa jump
@@ -473,7 +477,7 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory_map: &mut [Memor
         if jump_instr & 0xE0 == 0b1000_0000 {
             // cache instructions in the non-canonical NOP section are ignored since there is no cache
             return if condition_code.is_some() {
-                Err(format!("Invalid instruction at address {}. Cannot use condition prefix with conditional jumps", cpu_state.instruction_pointer).leak())
+                Err(format!("Invalid instruction at address {}. Cannot use condition prefix with conditional jumps", cpu_state.instruction_pointer))
             } else {
                 let condition_code = (jump_instr & 0xF) as u8;
                 let offset = if jump_instr & 0x10 != 0 {
@@ -497,7 +501,7 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory_map: &mut [Memor
         let saf_reg_jump_call = u16::from_le_bytes(instruction_data.as_slices().0[0..2].try_into().unwrap());
         if cpu_info.cpuid_1 & CP1_SAF != 0 && saf_reg_jump_call & 0xFF == 0b1010_1111 {
             if condition_code.is_some() {
-                return Err(format!("Invalid instruction at address {}. Cannot use a condition prefix with conditional jumps/calls", cpu_state.instruction_pointer).leak())
+                return Err(format!("Invalid instruction at address {}. Cannot use a condition prefix with conditional jumps/calls", cpu_state.instruction_pointer))
             }
 
             let call = saf_reg_jump_call & 0x1000 != 0;
@@ -535,10 +539,12 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory_map: &mut [Memor
 
             cpu_state.registers[7].value = (cpu_state.instruction_pointer + instruction_size + 2) as u64;
             cpu_state.instruction_pointer = cpu_state.instruction_pointer.wrapping_add(displacement);
+
+            return Ok(cpu_state)
         }
     }
 
-    Err(format!("Invalid instruction at address {}.", cpu_state.instruction_pointer).leak())
+    Err(format!("Invalid instruction at address {}.", cpu_state.instruction_pointer))
 }
 
 fn check_condition(condition_code: u8, flags: u8) -> bool {
