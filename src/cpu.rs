@@ -51,6 +51,10 @@ pub struct CPUInfo {
 
 impl CPUInfo {
     pub fn new(cpuid_1: u64, cpuid_2: u64, feat: u64) -> Result<CPUInfo, String> {
+        expect_set!(ALL_CP1, cpuid_1, format!("CP1 has unknown bits set: {}", (ALL_CP1 & cpuid_1) ^ cpuid_1));
+        expect_set!(ALL_CP2, cpuid_2, format!("CP2 has unknown bits set: {}", (ALL_CP2 & cpuid_2) ^ cpuid_2));
+        expect_set!(ALL_FT, feat, format!("FT has unknown bits set: {}", (ALL_FT & feat) ^ feat));
+
         if cpuid_1 & CP1_INT != 0 {
             expect_set!(cpuid_1, CP1_SAF, "Interrupt extension requires Stack and Functions extension");
             expect_set!(feat, FT_VON, "Interrupt extension requires Von Neumann feature");
