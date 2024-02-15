@@ -94,20 +94,7 @@ impl Register {
 
         let value = value & size.mask();
         self.value = if sign_extend {
-            match size {
-                ValueSize::HALF => {
-                    (value as i8) as u64
-                }
-                ValueSize::WORD => {
-                    (value as i16) as u64
-                }
-                ValueSize::DOUBLE => {
-                    (value as i32) as u64
-                }
-                ValueSize::QUAD => {
-                    value
-                }
-            }
+            size.sign_extend(value)
         } else {
             value
         };
