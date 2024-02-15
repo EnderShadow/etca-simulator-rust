@@ -111,7 +111,26 @@ pub enum ValueSize {
     QUAD
 }
 
+impl TryFrom<u8> for ValueSize {
+    type Error = String;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(ValueSize::HALF),
+            1 => Ok(ValueSize::WORD),
+            2 => Ok(ValueSize::DOUBLE),
+            3 => Ok(ValueSize::QUAD),
+            x => Err(format!("Invalid value for size: {x}"))
+        }
+    }
+}
+
 impl ValueSize {
+    #[inline]
+    fn from_u8(num: u8) -> ValueSize {
+        ValueSize::try_from(num).unwrap()
+    }
+
     #[inline]
     pub fn mask(&self) -> u64 {
         match self {
@@ -175,6 +194,16 @@ impl ValueSize {
     #[inline]
     pub fn zero_extend(&self, value: u64) -> u64 {
         value & self.mask()
+    }
+
+    #[inline]
+    pub fn get_msb(&self) -> u64 {
+        match self {
+            ValueSize::HALF => 0x80,
+            ValueSize::WORD => 0x8000,
+            ValueSize::DOUBLE => 0x8000_0000,
+            ValueSize::QUAD => 0x8000_0000_0000_0000
+        }
     }
 }
 
