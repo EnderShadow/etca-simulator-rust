@@ -46,11 +46,12 @@ pub struct CPUInfo {
     pub cpuid_1: u64,
     pub cpuid_2: u64,
     pub feat: u64,
+    pub force_allow_single_byte_nop: bool,
     _private: ()
 }
 
 impl CPUInfo {
-    pub fn new(cpuid_1: u64, cpuid_2: u64, feat: u64) -> Result<CPUInfo, String> {
+    pub fn new(cpuid_1: u64, cpuid_2: u64, feat: u64, force_allow_single_byte_nop: bool) -> Result<CPUInfo, String> {
         expect_set!(ALL_CP1, cpuid_1, format!("CP1 has unknown bits set: {}", (ALL_CP1 & cpuid_1) ^ cpuid_1));
         expect_set!(ALL_CP2, cpuid_2, format!("CP2 has unknown bits set: {}", (ALL_CP2 & cpuid_2) ^ cpuid_2));
         expect_set!(ALL_FT, feat, format!("FT has unknown bits set: {}", (ALL_FT & feat) ^ feat));
@@ -96,6 +97,7 @@ impl CPUInfo {
             cpuid_1,
             cpuid_2,
             feat,
+            force_allow_single_byte_nop,
             _private: ()
         })
     }
@@ -461,7 +463,8 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory_map: &mut [Memor
     }
 
     // there is technically nothing preventing this from being implemented without a VWI extension
-    if (cpu_info.cpuid_1 & 0x2031 != 0 || cpu_info.cpuid_2 & 0xB != 0) && instruction_data[0] == 0b1010_1110 {
+    if (cpu_info.force_allow_single_byte_nop || cpu_info.cpuid_1 & 0x2031 != 0 || cpu_info.cpuid_2 & 0x3 != 0) && instruction_data[0] == 0b1010_1110 {
+        // condition code does not matter since a skipped nop is the same as an executed nop
         cpu_state.instruction_pointer += instruction_size + 1;
         return Ok(cpu_state)
     }

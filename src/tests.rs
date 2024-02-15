@@ -4,31 +4,31 @@ mod tests {
 
     #[test]
     fn cpu_info_no_extensions() {
-        let cpu_info = CPUInfo::new(0, 0, 0);
+        let cpu_info = CPUInfo::new(0, 0, 0, false);
         assert!(cpu_info.is_ok())
     }
 
     #[test]
     fn cpu_info_all_defined_extensions() {
-        let cpu_info = CPUInfo::new(ALL_CP1, ALL_CP2, ALL_FT);
+        let cpu_info = CPUInfo::new(ALL_CP1, ALL_CP2, ALL_FT, false);
         assert!(cpu_info.is_ok())
     }
 
     #[test]
     fn cpu_info_missing_extensions() {
-        let cpu_info = CPUInfo::new(CP1_INT, 0, 0);
+        let cpu_info = CPUInfo::new(CP1_INT, 0, 0, false);
         assert!(cpu_info.is_err())
     }
 
     #[test]
     fn cpu_info_all_extensions() {
-        let cpu_info = CPUInfo::new(u64::MAX, u64::MAX, u64::MAX);
+        let cpu_info = CPUInfo::new(u64::MAX, u64::MAX, u64::MAX, false);
         assert!(cpu_info.is_err())
     }
 
     #[test]
     fn register_sign_extension() {
-        let cpu_info = CPUInfo::new(CP1_BYTE | CP1_QW, 0, 0).unwrap();
+        let cpu_info = CPUInfo::new(CP1_BYTE | CP1_QW, 0, 0, false).unwrap();
         let mut register = Register::default();
 
         register.write(&cpu_info, ValueSize::HALF, true, 255);
@@ -37,7 +37,7 @@ mod tests {
 
     #[test]
     fn register_zero_extension() {
-        let cpu_info = CPUInfo::new(CP1_BYTE | CP1_QW, 0, 0).unwrap();
+        let cpu_info = CPUInfo::new(CP1_BYTE | CP1_QW, 0, 0, false).unwrap();
         let mut register = Register::default();
 
         register.write(&cpu_info, ValueSize::HALF, false, 255);
@@ -47,7 +47,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn register_unimplemented_size() {
-        let cpu_info = CPUInfo::new(CP1_BYTE, 0, 0).unwrap();
+        let cpu_info = CPUInfo::new(CP1_BYTE, 0, 0, false).unwrap();
         let mut register = Register::default();
 
         register.write(&cpu_info, ValueSize::DOUBLE, false, 255);
