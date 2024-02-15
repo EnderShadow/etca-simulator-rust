@@ -290,6 +290,7 @@ impl MemoryMapSegment {
     }
 
     fn read(&self, cpu_info: &CPUInfo, address: usize, size: ValueSize, signed: bool) -> u64 {
+        // TODO support memory accesses which cross memory segments
         assert!(address >= self.start && address + size.num_bytes() <= self.end);
         assert!(cpu_info.feat & FT_UMA != 0 || size.is_aligned(address));
 
@@ -357,6 +358,7 @@ impl MemoryMapSegment {
     }
 
     fn write(&mut self, cpu_info: &CPUInfo, address: usize, size: ValueSize, value: u64) {
+        // TODO support memory accesses which cross memory segments
         assert!(address >= self.start && address + size.num_bytes() <= self.end);
         assert!(cpu_info.feat & FT_UMA != 0 || size.is_aligned(address));
 
@@ -393,7 +395,7 @@ impl MemoryMapSegment {
     }
 }
 
-fn read_instruction_data(instruction_pointer: usize, memory_map: &[MemoryMapSegment]) -> Result<VecDeque<u8>, &'static str> {
+fn read_instruction_data(instruction_pointer: usize, memory_map: &[MemoryMapSegment]) -> Result<VecDeque<u8>, String> {
     let mut instruction_data: VecDeque<u8> = VecDeque::with_capacity(MAX_INSTRUCTION_SIZE);
     let mut memory_map_segment = memory_map.iter().find(|x| instruction_pointer >= x.start && instruction_pointer < x.end);
     while instruction_data.len() < MAX_INSTRUCTION_SIZE {
@@ -402,8 +404,7 @@ fn read_instruction_data(instruction_pointer: usize, memory_map: &[MemoryMapSegm
             mms.read_instruction_bytes(instruction_pointer, &mut instruction_data, num_bytes);
             memory_map_segment = memory_map.iter().find(|x| x.start == mms.end);
         } else {
-            break;
-            //return Err(format!("Accessed unmapped memory segment at address {}", instruction_pointer).leak())
+            return Err(format!("Accessed unmapped memory segment at address {}", instruction_pointer))
         }
     }
 
