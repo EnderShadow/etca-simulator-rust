@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::cpu::{ALL_CP1, ALL_CP2, ALL_FT, CP1_BYTE, CP1_INT, CPUInfo};
-    use crate::{Register, ValueSize};
+    use crate::cpu::{ALL_CP1, ALL_CP2, ALL_FT, CP1_BYTE, CP1_INT, CP1_QW, CPUInfo, Register, ValueSize};
 
     #[test]
     fn cpu_info_no_extensions() {
@@ -29,33 +28,27 @@ mod tests {
 
     #[test]
     fn register_sign_extension() {
-        let cpu_info = CPUInfo::new(CP1_BYTE, 0, 0).unwrap();
-        let mut register = Register {
-            value: 0
-        };
+        let cpu_info = CPUInfo::new(CP1_BYTE | CP1_QW, 0, 0).unwrap();
+        let mut register = Register::default();
 
         register.write(&cpu_info, ValueSize::HALF, true, 255);
-        assert_eq!(register.value, u64::MAX)
+        assert_eq!(register.read(&cpu_info, ValueSize::QUAD), u64::MAX)
     }
 
     #[test]
     fn register_zero_extension() {
-        let cpu_info = CPUInfo::new(CP1_BYTE, 0, 0).unwrap();
-        let mut register = Register {
-            value: 0
-        };
+        let cpu_info = CPUInfo::new(CP1_BYTE | CP1_QW, 0, 0).unwrap();
+        let mut register = Register::default();
 
         register.write(&cpu_info, ValueSize::HALF, false, 255);
-        assert_eq!(register.value, 255)
+        assert_eq!(register.read(&cpu_info, ValueSize::QUAD), 255)
     }
 
     #[test]
     #[should_panic]
     fn register_unimplemented_size() {
         let cpu_info = CPUInfo::new(CP1_BYTE, 0, 0).unwrap();
-        let mut register = Register {
-            value: 0
-        };
+        let mut register = Register::default();
 
         register.write(&cpu_info, ValueSize::DOUBLE, false, 255);
     }
