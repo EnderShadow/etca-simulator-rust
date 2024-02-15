@@ -5,9 +5,9 @@ use std::fmt::format;
 use std::rc::Rc;
 
 macro_rules! expect_set {
-    ($x:expr, $y:expr, $msg:literal) => {
+    ($x:expr, $y:expr, $msg:expr) => {
         if $x & $y != $y {
-            return Err($msg);
+            return Err($msg.into());
         }
     }
 }
@@ -50,7 +50,7 @@ pub struct CPUInfo {
 }
 
 impl CPUInfo {
-    pub fn new(cpuid_1: u64, cpuid_2: u64, feat: u64) -> Result<CPUInfo, &'static str> {
+    pub fn new(cpuid_1: u64, cpuid_2: u64, feat: u64) -> Result<CPUInfo, String> {
         if cpuid_1 & CP1_INT != 0 {
             expect_set!(cpuid_1, CP1_SAF, "Interrupt extension requires Stack and Functions extension");
             expect_set!(feat, FT_VON, "Interrupt extension requires Von Neumann feature");
@@ -85,7 +85,7 @@ impl CPUInfo {
         let invalid_ft = feat & !ALL_FT;
 
         if invalid_cp1 != 0 || invalid_cp2 != 0 || invalid_ft != 0 {
-            return Err(format!("Unsupported extension(s) and/or feature(s) detected ({invalid_cp1}, {invalid_cp2}, {invalid_ft})").leak())
+            return Err(format!("Unsupported extension(s) and/or feature(s) detected ({invalid_cp1}, {invalid_cp2}, {invalid_ft})"))
         }
 
         Ok(CPUInfo {
