@@ -22,6 +22,16 @@ impl ValueSize {
     }
 
     #[inline]
+    fn inverse_mask(&self) -> u64 {
+        match self {
+            ValueSize::HALF => !0xFFu64,
+            ValueSize::WORD => !0xFFFFu64,
+            ValueSize::DOUBLE => !0xFFFF_FFFFu64,
+            ValueSize::QUAD => 0
+        }
+    }
+
+    #[inline]
     fn is_supported(&self, cpu_info: &CPUInfo) -> bool {
         match self {
             ValueSize::HALF => cpu_info.cpuid_1 & CP1_BYTE != 0,

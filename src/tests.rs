@@ -59,4 +59,9 @@ mod tests {
 
         register.write(&cpu_info, ValueSize::DOUBLE, false, 255);
     }
+
+    #[test]
+    fn inverse_mask_test() {
+        assert_eq!(ValueSize::HALF.inverse_mask(), 0xFFFF_FFFF_FFFF_FF00u64);
+    }
 }
