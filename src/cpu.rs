@@ -223,11 +223,13 @@ pub struct CPUState {
 }
 
 impl CPUState {
-    pub fn new() -> CPUState {
+    pub fn new(cache_line_size_p2: u8) -> CPUState {
+        let cache_line_size = 1 << cache_line_size_p2;
+
         CPUState {
             cr_priv: 1,
-            cr_cache_line_size: 8,
-            cr_no_cache_end: usize::MAX & !7,
+            cr_cache_line_size: cache_line_size,
+            cr_no_cache_end: usize::MAX & !(cache_line_size - 1),
             instruction_pointer: 0xFFFF_FFFF_FFFF_8000,
             .. CPUState::default()
         }
