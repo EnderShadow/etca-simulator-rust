@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use crate::cpu::{ALL_CP1, ALL_CP2, ALL_FT, CP1_BYTE, CP1_INT, CP1_QW, CPUInfo, Register, ValueSize};
     use crate::mem::Memory;
 
@@ -62,30 +63,33 @@ mod tests {
     #[test]
     fn non_overlapping_memory() {
         let mut memory = Memory::new();
-        memory.add_ram(0, 4096).unwrap();
-        memory.add_ram(4096, 4096).unwrap();
+        let page_size = NonZeroUsize::new(4096).unwrap();
+        memory.add_ram(0, page_size).unwrap();
+        memory.add_ram(4096, page_size).unwrap();
     }
 
     #[test]
     fn non_consecutive_memory() {
         let mut memory = Memory::new();
-        memory.add_ram(0, 4096).unwrap();
-        memory.add_ram(8192, 4096).unwrap();
-        memory.add_ram(4096, 4096).unwrap();
+        let page_size = NonZeroUsize::new(4096).unwrap();
+        memory.add_ram(0, page_size).unwrap();
+        memory.add_ram(8192, page_size).unwrap();
+        memory.add_ram(4096, page_size).unwrap();
     }
 
     #[test]
     #[should_panic]
     fn overlapping_memory() {
         let mut memory = Memory::new();
-        memory.add_ram(0, 4096).unwrap();
-        memory.add_ram(2048, 4096).unwrap();
+        let page_size = NonZeroUsize::new(4096).unwrap();
+        memory.add_ram(0, page_size).unwrap();
+        memory.add_ram(2048, page_size).unwrap();
     }
 
     #[test]
     #[should_panic]
     fn unaligned_memory() {
         let mut memory = Memory::new();
-        memory.add_ram(1, 1).unwrap();
+        memory.add_ram(1, NonZeroUsize::new(1).unwrap()).unwrap();
     }
 }
