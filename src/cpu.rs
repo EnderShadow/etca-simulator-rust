@@ -283,9 +283,9 @@ impl CPUState {
 }
 
 enum MemoryMapType {
-    Ram(Rc<RefCell<[u8]>>),
-    Rom(Rc<RefCell<[u8]>>),
-    TileRam(Rc<RefCell<[u8]>>)
+    Ram(Rc<RefCell<Box<[u8]>>>),
+    Rom(Rc<RefCell<Box<[u8]>>>),
+    TileRam(Rc<RefCell<Box<[u8]>>>)
 }
 
 pub struct MemoryMapSegment {
@@ -295,6 +295,54 @@ pub struct MemoryMapSegment {
 }
 
 impl MemoryMapSegment {
+    pub fn new_ram(start: usize, end: usize) -> MemoryMapSegment {
+        // require 8 byte aligned segments
+        assert_eq!(start & 0x7, 0);
+        assert_eq!(end & 0x7, 0);
+
+        let memory = vec![0u8; end - start].into_boxed_slice();
+
+        MemoryMapSegment {
+            start,
+            end,
+            mm_type: MemoryMapType::Ram(Rc::new(RefCell::new(memory)))
+        }
+    }
+
+    pub fn new_rom(start: usize, end: usize, data: &[u8]) -> MemoryMapSegment {
+        // require 8 byte aligned segments
+        assert_eq!(start & 0x7, 0);
+        assert_eq!(end & 0x7, 0);
+
+        let desired_length = end - start;
+        let fill_length = min(data.len(), desired_length);
+        let mut memory = Vec::with_capacity(desired_length);
+        memory.extend_from_slice(&data[..fill_length]);
+        memory.resize(desired_length, 0);
+        let memory = memory.into_boxed_slice();
+
+        MemoryMapSegment {
+            start,
+            end,
+            mm_type: MemoryMapType::Rom(Rc::new(RefCell::new(memory)))
+        }
+    }
+
+    pub fn new_tiled_ram(start: usize, end: usize, tile_size: usize) -> MemoryMapSegment {
+        // require 8 byte aligned segments
+        assert_eq!(start & 0x7, 0);
+        assert_eq!(end & 0x7, 0);
+        assert!(tile_size <= end - start);
+
+        let memory = vec![0u8; tile_size].into_boxed_slice();
+
+        MemoryMapSegment {
+            start,
+            end,
+            mm_type: MemoryMapType::TileRam(Rc::new(RefCell::new(memory)))
+        }
+    }
+
     fn read_instruction_bytes(&self, address: usize, buffer: &mut VecDeque<u8>, num_bytes: usize) {
         assert!(address >= self.start);
 
