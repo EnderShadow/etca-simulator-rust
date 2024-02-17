@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::cpu::{ALL_CP1, ALL_CP2, ALL_FT, CP1_BYTE, CP1_INT, CP1_QW, CPUInfo, Register, ValueSize};
+    use crate::mem::Memory;
 
     #[test]
     fn cpu_info_no_extensions() {
@@ -56,5 +57,35 @@ mod tests {
     #[test]
     fn inverse_mask_test() {
         assert_eq!(ValueSize::HALF.inverse_mask(), 0xFFFF_FFFF_FFFF_FF00u64);
+    }
+
+    #[test]
+    fn non_overlapping_memory() {
+        let mut memory = Memory::new();
+        memory.add_ram(0, 4096).unwrap();
+        memory.add_ram(4096, 4096).unwrap();
+    }
+
+    #[test]
+    fn non_consecutive_memory() {
+        let mut memory = Memory::new();
+        memory.add_ram(0, 4096).unwrap();
+        memory.add_ram(8192, 4096).unwrap();
+        memory.add_ram(4096, 4096).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn overlapping_memory() {
+        let mut memory = Memory::new();
+        memory.add_ram(0, 4096).unwrap();
+        memory.add_ram(2048, 4096).unwrap();
+    }
+
+    #[test]
+    #[should_panic]
+    fn unaligned_memory() {
+        let mut memory = Memory::new();
+        memory.add_ram(1, 1).unwrap();
     }
 }

@@ -3,6 +3,7 @@ use std::cmp::min;
 use std::collections::VecDeque;
 use std::fmt::format;
 use std::rc::Rc;
+use crate::mem::Memory;
 
 macro_rules! expect_set {
     ($x:expr, $y:expr, $msg:expr) => {
@@ -40,7 +41,7 @@ pub const ALL_CP1: u64 = 0x1_0001_E0FF;
 pub const ALL_CP2: u64 = 0xF;
 pub const ALL_FT: u64 = 0xF;
 
-const MAX_INSTRUCTION_SIZE: usize = 16;
+pub const MAX_INSTRUCTION_SIZE: usize = 16;
 
 const CACHE_LINE_SIZE: usize = 8;
 
@@ -282,220 +283,9 @@ impl CPUState {
     }
 }
 
-enum MemoryMapType {
-    Ram(Rc<RefCell<Box<[u8]>>>),
-    Rom(Rc<RefCell<Box<[u8]>>>),
-    TileRam(Rc<RefCell<Box<[u8]>>>)
-}
-
-pub struct MemoryMapSegment {
-    start: usize,
-    end: usize,
-    mm_type: MemoryMapType
-}
-
-impl MemoryMapSegment {
-    pub fn new_ram(start: usize, end: usize) -> MemoryMapSegment {
-        // require 8 byte aligned segments
-        assert_eq!(start & 0x7, 0);
-        assert_eq!(end & 0x7, 0);
-
-        let memory = vec![0u8; end - start].into_boxed_slice();
-
-        MemoryMapSegment {
-            start,
-            end,
-            mm_type: MemoryMapType::Ram(Rc::new(RefCell::new(memory)))
-        }
-    }
-
-    pub fn new_rom(start: usize, end: usize, data: &[u8]) -> MemoryMapSegment {
-        // require 8 byte aligned segments
-        assert_eq!(start & 0x7, 0);
-        assert_eq!(end & 0x7, 0);
-
-        let desired_length = end - start;
-        let fill_length = min(data.len(), desired_length);
-        let mut memory = Vec::with_capacity(desired_length);
-        memory.extend_from_slice(&data[..fill_length]);
-        memory.resize(desired_length, 0);
-        let memory = memory.into_boxed_slice();
-
-        MemoryMapSegment {
-            start,
-            end,
-            mm_type: MemoryMapType::Rom(Rc::new(RefCell::new(memory)))
-        }
-    }
-
-    pub fn new_tiled_ram(start: usize, end: usize, tile_size: usize) -> MemoryMapSegment {
-        // require 8 byte aligned segments
-        assert_eq!(start & 0x7, 0);
-        assert_eq!(end & 0x7, 0);
-        assert!(tile_size <= end - start);
-
-        let memory = vec![0u8; tile_size].into_boxed_slice();
-
-        MemoryMapSegment {
-            start,
-            end,
-            mm_type: MemoryMapType::TileRam(Rc::new(RefCell::new(memory)))
-        }
-    }
-
-    fn read_instruction_bytes(&self, address: usize, buffer: &mut VecDeque<u8>, num_bytes: usize) {
-        assert!(address >= self.start);
-
-        let offset = address - self.start;
-        let length = min(num_bytes, self.end - address);
-
-        match &self.mm_type {
-            MemoryMapType::Ram(data) => {
-                buffer.extend(&data.borrow()[offset..offset + length]);
-            }
-            MemoryMapType::Rom(data) => {
-                buffer.extend(&data.borrow()[offset..offset + length]);
-            }
-            MemoryMapType::TileRam(data) => {
-                let mut offset = offset % data.borrow().len();
-                let mut length = length;
-                while offset + length > data.borrow().len() {
-                    buffer.extend(&data.borrow()[offset..]);
-                    length -= &data.borrow().len() - offset;
-                    offset = 0;
-                }
-                buffer.extend(&data.borrow()[offset..offset + length]);
-            }
-        }
-    }
-
-    fn read(&self, cpu_info: &CPUInfo, address: usize, size: ValueSize, signed: bool) -> u64 {
-        // TODO support memory accesses which cross memory segments
-        assert!(address >= self.start && address + size.num_bytes() <= self.end);
-        assert!(cpu_info.feat & FT_UMA != 0 || size.is_aligned(address));
-
-        let offset = address - self.start;
-        match &self.mm_type {
-            MemoryMapType::Ram(data) => {
-                assert_eq!(self.end - self.start, data.borrow().len());
-                if signed {
-                    match size {
-                        ValueSize::HALF => (data.borrow()[offset] as i8) as u64,
-                        ValueSize::WORD => i16::from_le_bytes(data.borrow()[offset..offset + 2].try_into().unwrap()) as u64,
-                        ValueSize::DOUBLE => i32::from_le_bytes(data.borrow()[offset..offset + 4].try_into().unwrap()) as u64,
-                        ValueSize::QUAD => i64::from_le_bytes(data.borrow()[offset..offset + 8].try_into().unwrap()) as u64
-                    }
-                } else {
-                    match size {
-                        ValueSize::HALF => data.borrow()[offset] as u64,
-                        ValueSize::WORD => u16::from_le_bytes(data.borrow()[offset..offset + 2].try_into().unwrap()) as u64,
-                        ValueSize::DOUBLE => u32::from_le_bytes(data.borrow()[offset..offset + 4].try_into().unwrap()) as u64,
-                        ValueSize::QUAD => u64::from_le_bytes(data.borrow()[offset..offset + 8].try_into().unwrap())
-                    }
-                }
-            }
-            MemoryMapType::Rom(data) => {
-                assert_eq!(self.end - self.start, data.borrow().len());
-                if signed {
-                    match size {
-                        ValueSize::HALF => (data.borrow()[offset] as i8) as u64,
-                        ValueSize::WORD => i16::from_le_bytes(data.borrow()[offset..offset + 2].try_into().unwrap()) as u64,
-                        ValueSize::DOUBLE => i32::from_le_bytes(data.borrow()[offset..offset + 4].try_into().unwrap()) as u64,
-                        ValueSize::QUAD => i64::from_le_bytes(data.borrow()[offset..offset + 8].try_into().unwrap()) as u64
-                    }
-                } else {
-                    match size {
-                        ValueSize::HALF => data.borrow()[offset] as u64,
-                        ValueSize::WORD => u16::from_le_bytes(data.borrow()[offset..offset + 2].try_into().unwrap()) as u64,
-                        ValueSize::DOUBLE => u32::from_le_bytes(data.borrow()[offset..offset + 4].try_into().unwrap()) as u64,
-                        ValueSize::QUAD => u64::from_le_bytes(data.borrow()[offset..offset + 8].try_into().unwrap())
-                    }
-                }
-            }
-            MemoryMapType::TileRam(data) => {
-                let mut temp_buffer: Vec<u8> = Vec::with_capacity(8);
-                while temp_buffer.len() < 8 {
-                    temp_buffer.extend(data.borrow().iter());
-                }
-
-                if signed {
-                    match size {
-                        ValueSize::HALF => (temp_buffer[offset] as i8) as u64,
-                        ValueSize::WORD => i16::from_le_bytes(temp_buffer[offset..offset + 2].try_into().unwrap()) as u64,
-                        ValueSize::DOUBLE => i32::from_le_bytes(temp_buffer[offset..offset + 4].try_into().unwrap()) as u64,
-                        ValueSize::QUAD => i64::from_le_bytes(temp_buffer[offset..offset + 8].try_into().unwrap()) as u64
-                    }
-                } else {
-                    match size {
-                        ValueSize::HALF => temp_buffer[offset] as u64,
-                        ValueSize::WORD => u16::from_le_bytes(temp_buffer[offset..offset + 2].try_into().unwrap()) as u64,
-                        ValueSize::DOUBLE => u32::from_le_bytes(temp_buffer[offset..offset + 4].try_into().unwrap()) as u64,
-                        ValueSize::QUAD => u64::from_le_bytes(temp_buffer[offset..offset + 8].try_into().unwrap())
-                    }
-                }
-            }
-        }
-    }
-
-    fn write(&mut self, cpu_info: &CPUInfo, address: usize, size: ValueSize, value: u64) {
-        // TODO support memory accesses which cross memory segments
-        assert!(address >= self.start && address + size.num_bytes() <= self.end);
-        assert!(cpu_info.feat & FT_UMA != 0 || size.is_aligned(address));
-
-        let offset = address - self.start;
-        match &self.mm_type {
-            MemoryMapType::Ram(data) => {
-                assert_eq!(self.end - self.start, data.borrow().len());
-                match size {
-                    ValueSize::HALF => data.borrow_mut()[offset] = value as u8,
-                    ValueSize::WORD => data.borrow_mut()[offset..offset + 2].copy_from_slice(&(value as u16).to_le_bytes()[..]),
-                    ValueSize::DOUBLE => data.borrow_mut()[offset..offset + 4].copy_from_slice(&(value as u32).to_le_bytes()[..]),
-                    ValueSize::QUAD => data.borrow_mut()[offset..offset + 8].copy_from_slice(&value.to_le_bytes()[..])
-                }
-            }
-            MemoryMapType::Rom(_) => {
-                // ignore writes
-            }
-            MemoryMapType::TileRam(data) => {
-                let byte_vec = match size {
-                    ValueSize::HALF => vec![value as u8],
-                    ValueSize::WORD => (value as u16).to_le_bytes().to_vec(),
-                    ValueSize::DOUBLE => (value as u32).to_le_bytes().to_vec(),
-                    ValueSize::QUAD => value.to_le_bytes().to_vec()
-                };
-
-                let mut offset = offset;
-                let mut mut_data = data.borrow_mut();
-                for byte in byte_vec.iter() {
-                    mut_data[offset] = *byte;
-                    offset = (offset + 1) % mut_data.len();
-                }
-            }
-        };
-    }
-}
-
-fn read_instruction_data(instruction_pointer: usize, memory_map: &[MemoryMapSegment]) -> Result<VecDeque<u8>, String> {
-    let mut instruction_data: VecDeque<u8> = VecDeque::with_capacity(MAX_INSTRUCTION_SIZE);
-    let mut memory_map_segment = memory_map.iter().find(|x| instruction_pointer >= x.start && instruction_pointer < x.end);
-    while instruction_data.len() < MAX_INSTRUCTION_SIZE {
-        if let Some(mms) = memory_map_segment {
-            let num_bytes = MAX_INSTRUCTION_SIZE - instruction_data.len();
-            mms.read_instruction_bytes(instruction_pointer, &mut instruction_data, num_bytes);
-            memory_map_segment = memory_map.iter().find(|x| x.start == mms.end);
-        } else {
-            return Err(format!("Accessed unmapped memory segment at address {}", instruction_pointer))
-        }
-    }
-
-    // instruction_data.len() <= MAX_INSTRUCTION_SIZE
-
-    Ok(instruction_data)
-}
-
-pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory_map: &mut [MemoryMapSegment]) -> Result<CPUState, String> {
+pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) -> Result<CPUState, String> {
     // instruction_data is assumed to be contiguous since data is never added to it after read_instruction_data returns
-    let mut instruction_data = read_instruction_data(cpu_state.instruction_pointer, memory_map).unwrap();
+    let mut instruction_data = memory.read_instruction_data(cpu_state.instruction_pointer).unwrap();
     assert_eq!(instruction_data.as_slices().1.len(), 0, "instruction_data should be contiguous");
 
     if instruction_data.len() < 1 {
