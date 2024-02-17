@@ -42,6 +42,8 @@ pub const ALL_FT: u64 = 0xF;
 
 const MAX_INSTRUCTION_SIZE: usize = 16;
 
+const CACHE_LINE_SIZE: usize = 8;
+
 pub struct CPUInfo {
     pub cpuid_1: u64,
     pub cpuid_2: u64,
@@ -259,13 +261,11 @@ pub struct CPUState {
 }
 
 impl CPUState {
-    pub fn new(cache_line_size_p2: u8) -> CPUState {
-        let cache_line_size = 1 << cache_line_size_p2;
-
+    pub fn new() -> CPUState {
         CPUState {
             cr_priv: 1,
-            cr_cache_line_size: cache_line_size,
-            cr_no_cache_end: usize::MAX & !(cache_line_size - 1),
+            cr_cache_line_size: CACHE_LINE_SIZE,
+            cr_no_cache_end: usize::MAX & !(CACHE_LINE_SIZE - 1),
             instruction_pointer: 0xFFFF_FFFF_FFFF_8000,
             .. CPUState::default()
         }
