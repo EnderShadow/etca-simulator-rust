@@ -46,48 +46,22 @@ impl MemoryMapSegment {
         }
     }
 
-    fn read(&self, cpu_info: &CPUInfo, address: usize, size: ValueSize, signed: bool) -> u64 {
-        // TODO support memory accesses which cross memory segments
-        assert!(address >= self.start && size.num_bytes() <= self.size);
-        assert!(cpu_info.feat & FT_UMA != 0 || size.is_aligned(address));
-
+    fn read_aligned(&self, address: usize, size: ValueSize) -> u64 {
         let offset = address - self.start;
+        let read_from_bytes: Box<dyn Fn(&[u8]) -> u64> = match size {
+            ValueSize::HALF => Box::new(|mem: &[u8]| -> u64 {u8::from_le_bytes(mem[offset..offset + size.num_bytes()].try_into().unwrap()) as u64}),
+            ValueSize::WORD => Box::new(|mem: &[u8]| -> u64 {u16::from_le_bytes(mem[offset..offset + size.num_bytes()].try_into().unwrap()) as u64}),
+            ValueSize::DOUBLE => Box::new(|mem: &[u8]| -> u64 {u32::from_le_bytes(mem[offset..offset + size.num_bytes()].try_into().unwrap()) as u64}),
+            ValueSize::QUAD => Box::new(|mem: &[u8]| -> u64 {u64::from_le_bytes(mem[offset..offset + size.num_bytes()].try_into().unwrap())})
+        };
         match &self.mm_type {
             MemoryMapType::Ram(data) => {
                 assert_eq!(self.size, data.borrow().len());
-                if signed {
-                    match size {
-                        ValueSize::HALF => (data.borrow()[offset] as i8) as u64,
-                        ValueSize::WORD => i16::from_le_bytes(data.borrow()[offset..offset + 2].try_into().unwrap()) as u64,
-                        ValueSize::DOUBLE => i32::from_le_bytes(data.borrow()[offset..offset + 4].try_into().unwrap()) as u64,
-                        ValueSize::QUAD => i64::from_le_bytes(data.borrow()[offset..offset + 8].try_into().unwrap()) as u64
-                    }
-                } else {
-                    match size {
-                        ValueSize::HALF => data.borrow()[offset] as u64,
-                        ValueSize::WORD => u16::from_le_bytes(data.borrow()[offset..offset + 2].try_into().unwrap()) as u64,
-                        ValueSize::DOUBLE => u32::from_le_bytes(data.borrow()[offset..offset + 4].try_into().unwrap()) as u64,
-                        ValueSize::QUAD => u64::from_le_bytes(data.borrow()[offset..offset + 8].try_into().unwrap())
-                    }
-                }
+                read_from_bytes(&**data.borrow())
             }
             MemoryMapType::Rom(data) => {
                 assert_eq!(self.size, data.borrow().len());
-                if signed {
-                    match size {
-                        ValueSize::HALF => (data.borrow()[offset] as i8) as u64,
-                        ValueSize::WORD => i16::from_le_bytes(data.borrow()[offset..offset + 2].try_into().unwrap()) as u64,
-                        ValueSize::DOUBLE => i32::from_le_bytes(data.borrow()[offset..offset + 4].try_into().unwrap()) as u64,
-                        ValueSize::QUAD => i64::from_le_bytes(data.borrow()[offset..offset + 8].try_into().unwrap()) as u64
-                    }
-                } else {
-                    match size {
-                        ValueSize::HALF => data.borrow()[offset] as u64,
-                        ValueSize::WORD => u16::from_le_bytes(data.borrow()[offset..offset + 2].try_into().unwrap()) as u64,
-                        ValueSize::DOUBLE => u32::from_le_bytes(data.borrow()[offset..offset + 4].try_into().unwrap()) as u64,
-                        ValueSize::QUAD => u64::from_le_bytes(data.borrow()[offset..offset + 8].try_into().unwrap())
-                    }
-                }
+                read_from_bytes(&**data.borrow())
             }
             MemoryMapType::TileRam(data) => {
                 let mut temp_buffer: Vec<u8> = Vec::with_capacity(8);
@@ -95,30 +69,12 @@ impl MemoryMapSegment {
                     temp_buffer.extend(data.borrow().iter());
                 }
 
-                if signed {
-                    match size {
-                        ValueSize::HALF => (temp_buffer[offset] as i8) as u64,
-                        ValueSize::WORD => i16::from_le_bytes(temp_buffer[offset..offset + 2].try_into().unwrap()) as u64,
-                        ValueSize::DOUBLE => i32::from_le_bytes(temp_buffer[offset..offset + 4].try_into().unwrap()) as u64,
-                        ValueSize::QUAD => i64::from_le_bytes(temp_buffer[offset..offset + 8].try_into().unwrap()) as u64
-                    }
-                } else {
-                    match size {
-                        ValueSize::HALF => temp_buffer[offset] as u64,
-                        ValueSize::WORD => u16::from_le_bytes(temp_buffer[offset..offset + 2].try_into().unwrap()) as u64,
-                        ValueSize::DOUBLE => u32::from_le_bytes(temp_buffer[offset..offset + 4].try_into().unwrap()) as u64,
-                        ValueSize::QUAD => u64::from_le_bytes(temp_buffer[offset..offset + 8].try_into().unwrap())
-                    }
-                }
+                read_from_bytes(&temp_buffer)
             }
         }
     }
 
-    fn write(&mut self, cpu_info: &CPUInfo, address: usize, size: ValueSize, value: u64) {
-        // TODO support memory accesses which cross memory segments
-        assert!(address >= self.start && size.num_bytes() <= self.size);
-        assert!(cpu_info.feat & FT_UMA != 0 || size.is_aligned(address));
-
+    fn write_aligned(&mut self, address: usize, size: ValueSize, value: u64) {
         let offset = address - self.start;
         match &self.mm_type {
             MemoryMapType::Ram(data) => {
@@ -141,8 +97,8 @@ impl MemoryMapSegment {
                     ValueSize::QUAD => value.to_le_bytes().to_vec()
                 };
 
-                let mut offset = offset;
                 let mut mut_data = data.borrow_mut();
+                let mut offset = offset % mut_data.len();
                 for byte in byte_vec.iter() {
                     mut_data[offset] = *byte;
                     offset = (offset + 1) % mut_data.len();
@@ -150,6 +106,12 @@ impl MemoryMapSegment {
             }
         };
     }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum MemoryError {
+    NotMapped,
+    Unaligned
 }
 
 pub struct Memory {
@@ -265,12 +227,35 @@ impl Memory {
         Ok(())
     }
 
-    pub fn read(self: &Self, address: usize, size: ValueSize, allow_unaligned: bool) -> Result<u64, String> {
-        unimplemented!()
+    pub fn read(self: &Self, address: usize, size: ValueSize, allow_unaligned: bool) -> Result<u64, MemoryError> {
+        if size.is_aligned(address) {
+            let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
+            if let Some(segment) = segment {
+                Ok(segment.read_aligned(address, size))
+            } else {
+                Err(MemoryError::NotMapped)
+            }
+        } else if allow_unaligned {
+            unimplemented!()
+        } else {
+            Err(MemoryError::Unaligned)
+        }
     }
 
-    pub fn write(self: &mut Self, address: usize, size: ValueSize, value: u64, allow_unaligned: bool) -> Result<u64, String> {
-        unimplemented!()
+    pub fn write(self: &mut Self, address: usize, size: ValueSize, value: u64, allow_unaligned: bool) -> Result<(), MemoryError> {
+        if size.is_aligned(address) {
+            let segment = self.memory_segments.iter_mut().find(|x| x.start <= address && address - x.start < x.size);
+            if let Some(segment) = segment {
+                segment.write_aligned(address, size, value);
+                Ok(())
+            } else {
+                Err(MemoryError::NotMapped)
+            }
+        } else if allow_unaligned {
+            unimplemented!()
+        } else {
+            Err(MemoryError::Unaligned)
+        }
     }
 
     pub fn read_instruction_data(self: &Self, instruction_pointer: usize) -> Result<VecDeque<u8>, String> {

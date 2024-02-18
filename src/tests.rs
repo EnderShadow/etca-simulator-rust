@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use std::io::repeat;
     use std::num::NonZeroUsize;
     use crate::cpu::{ALL_CP1, ALL_CP2, ALL_FT, CP1_BYTE, CP1_INT, CP1_QW, CPUInfo, Register, ValueSize};
     use crate::mem::Memory;
@@ -88,8 +89,47 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn unaligned_memory() {
+    fn unaligned_memory_segment() {
         let mut memory = Memory::new();
         memory.add_ram(1, NonZeroUsize::new(1).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn ram_write_read_test() {
+        let mut memory = Memory::new();
+        memory.add_ram(0, NonZeroUsize::new(256).unwrap()).unwrap();
+
+        for i in 0usize..256 {
+            memory.write(i, ValueSize::HALF, i as u64 + 1, false).unwrap();
+        }
+
+        for i in 0usize..256 {
+            let value = memory.read(i, ValueSize::HALF, false).unwrap();
+            assert_eq!(value, ValueSize::HALF.zero_extend(i as u64 + 1))
+        }
+    }
+
+    #[test]
+    fn tiled_ram_write_read_test() {
+        let mut memory = Memory::new();
+        memory.add_tiled_ram(0, NonZeroUsize::new(256).unwrap(), 128).unwrap();
+
+        for i in 0usize..256 {
+            memory.write(i, ValueSize::HALF, i as u64 + 1, false).unwrap();
+        }
+
+        for i in 0usize..128 {
+            let value = memory.read(i, ValueSize::HALF, false).unwrap();
+            assert_eq!(value, ValueSize::HALF.zero_extend(i as u64 + 129))
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn unaligned_memory_access() {
+        let mut memory = Memory::new();
+        memory.add_ram(0, NonZeroUsize::new(256).unwrap()).unwrap();
+
+        memory.read(1, ValueSize::QUAD, false).unwrap();
     }
 }
