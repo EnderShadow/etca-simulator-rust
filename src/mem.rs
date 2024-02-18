@@ -125,7 +125,7 @@ impl Memory {
         }
     }
 
-    pub fn dump_memory_map(self: &Self) -> Vec<String> {
+    pub fn dump_memory_map(&self) -> Vec<String> {
         let mut mapping = Vec::new();
 
         let mut sorted_segments = self.memory_segments.iter().map(|ms| {
@@ -144,7 +144,7 @@ impl Memory {
         mapping
     }
 
-    pub fn add_ram(self: &mut Self, start: usize, size: NonZeroUsize) -> Result<(), String> {
+    pub fn add_ram(&mut self, start: usize, size: NonZeroUsize) -> Result<(), String> {
         let size = size.into();
         // require 8 byte aligned segments
         assert_eq!(start & 0x7, 0);
@@ -170,7 +170,7 @@ impl Memory {
         Ok(())
     }
 
-    pub fn add_rom(self: &mut Self, start: usize, size: NonZeroUsize, data: &[u8]) -> Result<(), String> {
+    pub fn add_rom(&mut self, start: usize, size: NonZeroUsize, data: &[u8]) -> Result<(), String> {
         let size = size.into();
         // require 8 byte aligned segments
         assert_eq!(start & 0x7, 0);
@@ -200,7 +200,7 @@ impl Memory {
         Ok(())
     }
 
-    pub fn add_tiled_ram(self: &mut Self, start: usize, size: NonZeroUsize, tile_size: usize) -> Result<(), String> {
+    pub fn add_tiled_ram(&mut self, start: usize, size: NonZeroUsize, tile_size: usize) -> Result<(), String> {
         let size = size.into();
         // require 8 byte aligned segments
         assert_eq!(start & 0x7, 0);
@@ -227,7 +227,7 @@ impl Memory {
         Ok(())
     }
 
-    pub fn read(self: &Self, address: usize, size: ValueSize, allow_unaligned: bool) -> Result<u64, MemoryError> {
+    pub fn read(&self, address: usize, size: ValueSize, allow_unaligned: bool) -> Result<u64, MemoryError> {
         if size.is_aligned(address) {
             let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
             if let Some(segment) = segment {
@@ -242,7 +242,7 @@ impl Memory {
         }
     }
 
-    pub fn write(self: &mut Self, address: usize, size: ValueSize, value: u64, allow_unaligned: bool) -> Result<(), MemoryError> {
+    pub fn write(&mut self, address: usize, size: ValueSize, value: u64, allow_unaligned: bool) -> Result<(), MemoryError> {
         if size.is_aligned(address) {
             let segment = self.memory_segments.iter_mut().find(|x| x.start <= address && address - x.start < x.size);
             if let Some(segment) = segment {
@@ -258,7 +258,7 @@ impl Memory {
         }
     }
 
-    pub fn read_instruction_data(self: &Self, instruction_pointer: usize) -> Result<VecDeque<u8>, String> {
+    pub fn read_instruction_data(&self, instruction_pointer: usize) -> Result<VecDeque<u8>, String> {
         let mut instruction_data: VecDeque<u8> = VecDeque::with_capacity(crate::cpu::MAX_INSTRUCTION_SIZE);
         let mut memory_map_segment = self.memory_segments.iter().find(|x| instruction_pointer >= x.start && instruction_pointer - x.start < x.size);
         while instruction_data.len() < crate::cpu::MAX_INSTRUCTION_SIZE {
