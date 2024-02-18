@@ -126,10 +126,33 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn unaligned_memory_access() {
+    fn failing_unaligned_memory_access() {
         let mut memory = Memory::new();
         memory.add_ram(0, NonZeroUsize::new(256).unwrap()).unwrap();
 
         memory.read(1, ValueSize::QUAD, false).unwrap();
+    }
+
+    #[test]
+    fn successful_unaligned_memory_access() {
+        let mut memory = Memory::new();
+        memory.add_ram(0, NonZeroUsize::new(256).unwrap()).unwrap();
+
+        memory.write(1, ValueSize::DOUBLE, 0x12345678, true).unwrap();
+        let value = memory.read(1, ValueSize::DOUBLE, true).unwrap();
+
+        assert_eq!(value, 0x12345678)
+    }
+
+    #[test]
+    fn multi_segment_memory_read() {
+        let mut memory = Memory::new();
+        memory.add_ram(0, NonZeroUsize::new(256).unwrap()).unwrap();
+        memory.add_ram(256, NonZeroUsize::new(256).unwrap()).unwrap();
+
+        memory.write(254, ValueSize::DOUBLE, 0x12345678, true).unwrap();
+        let value = memory.read(254, ValueSize::DOUBLE, true).unwrap();
+
+        assert_eq!(value, 0x12345678)
     }
 }
