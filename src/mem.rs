@@ -5,7 +5,7 @@ use std::fmt::Debug;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use range_ext::intersect::{Intersect, Intersection};
-use crate::cpu::{CPUInfo, FT_UMA, ValueSize};
+use crate::cpu::{MAX_INSTRUCTION_SIZE, ValueSize};
 
 enum MemoryMapType {
     Ram(Rc<RefCell<Box<[u8]>>>),
@@ -20,32 +20,6 @@ struct MemoryMapSegment {
 }
 
 impl MemoryMapSegment {
-    fn read_instruction_bytes(&self, address: usize, buffer: &mut VecDeque<u8>, num_bytes: usize) {
-        assert!(address >= self.start);
-
-        let offset = address - self.start;
-        let length = min(num_bytes, self.size);
-
-        match &self.mm_type {
-            MemoryMapType::Ram(data) => {
-                buffer.extend(&data.borrow()[offset..offset + length]);
-            }
-            MemoryMapType::Rom(data) => {
-                buffer.extend(&data.borrow()[offset..offset + length]);
-            }
-            MemoryMapType::TileRam(data) => {
-                let mut offset = offset % data.borrow().len();
-                let mut length = length;
-                while offset + length > data.borrow().len() {
-                    buffer.extend(&data.borrow()[offset..]);
-                    length -= &data.borrow().len() - offset;
-                    offset = 0;
-                }
-                buffer.extend(&data.borrow()[offset..offset + length]);
-            }
-        }
-    }
-
     fn read_aligned(&self, address: usize, size: ValueSize) -> u64 {
         let offset = address - self.start;
         let read_from_bytes: Box<dyn Fn(&[u8]) -> u64> = match size {
@@ -56,11 +30,9 @@ impl MemoryMapSegment {
         };
         match &self.mm_type {
             MemoryMapType::Ram(data) => {
-                assert_eq!(self.size, data.borrow().len());
                 read_from_bytes(&**data.borrow())
             }
             MemoryMapType::Rom(data) => {
-                assert_eq!(self.size, data.borrow().len());
                 read_from_bytes(&**data.borrow())
             }
             MemoryMapType::TileRam(data) => {
@@ -73,12 +45,38 @@ impl MemoryMapSegment {
             }
         }
     }
+    
+    fn read_bytes(&self, address: usize, buffer: &mut Vec<u8>, num_bytes_to_read: usize) -> usize {
+        let offset = address - self.start;
+        let num_bytes = min(self.size - offset, num_bytes_to_read);
+
+        match &self.mm_type {
+            MemoryMapType::Ram(data) => {
+                buffer.extend_from_slice(&data.borrow()[offset..offset + num_bytes]);
+            }
+            MemoryMapType::Rom(data) => {
+                buffer.extend_from_slice(&data.borrow()[offset..offset + num_bytes]);
+            }
+            MemoryMapType::TileRam(data) => {
+                let tile_length = data.borrow().len();
+                let mut offset = offset % tile_length;
+                let mut read_bytes = 0usize;
+                while read_bytes < num_bytes {
+                    let num_to_copy = min(tile_length - offset, num_bytes - read_bytes);
+                    buffer.extend_from_slice(&data.borrow()[offset..offset + num_to_copy]);
+                    offset = 0;
+                    read_bytes += num_to_copy;
+                }
+            }
+        };
+
+        num_bytes
+    }
 
     fn write_aligned(&mut self, address: usize, size: ValueSize, value: u64) {
         let offset = address - self.start;
         match &self.mm_type {
             MemoryMapType::Ram(data) => {
-                assert_eq!(self.size, data.borrow().len());
                 match size {
                     ValueSize::HALF => data.borrow_mut()[offset] = value as u8,
                     ValueSize::WORD => data.borrow_mut()[offset..offset + 2].copy_from_slice(&(value as u16).to_le_bytes()[..]),
@@ -105,6 +103,43 @@ impl MemoryMapSegment {
                 }
             }
         };
+    }
+
+    fn write_bytes(&self, address: usize, data_to_write: &[u8], write_amount: usize) -> usize {
+        let offset = address - self.start;
+        let num_bytes = min(self.size - offset, write_amount);
+
+        match &self.mm_type {
+            MemoryMapType::Ram(data) => {
+                data.borrow_mut()[offset..offset + num_bytes].copy_from_slice(&data_to_write[0..num_bytes]);
+            }
+            MemoryMapType::Rom(_) => {
+                // ignore writes
+            }
+            MemoryMapType::TileRam(data) => {
+                let tile_length = data.borrow().len();
+                let mut offset = offset % tile_length;
+                let mut written_bytes = 0usize;
+                let mut data_to_write = data_to_write;
+
+                // if more than 2 full overwrites will occur, skip writes which are guaranteed to be lost.
+                if num_bytes > 2 * tile_length {
+                    let num_overwrites = num_bytes % tile_length - 2;
+                    written_bytes = num_overwrites * tile_length;
+                    data_to_write = &data_to_write[written_bytes..];
+                }
+
+                while written_bytes < num_bytes {
+                    let num_to_copy = min(tile_length - offset, num_bytes - written_bytes);
+                    data.borrow_mut()[offset..offset + num_to_copy].copy_from_slice(&data_to_write[0..num_to_copy]);
+                    offset = 0;
+                    written_bytes += num_to_copy;
+                    data_to_write = &data_to_write[num_to_copy..];
+                }
+            }
+        };
+
+        num_bytes
     }
 }
 
@@ -236,7 +271,28 @@ impl Memory {
                 Err(MemoryError::NotMapped)
             }
         } else if allow_unaligned {
-            unimplemented!()
+            let num_bytes_to_read = size.num_bytes();
+            let mut buffer = Vec::with_capacity(num_bytes_to_read);
+            let mut address = address;
+            while buffer.len() < num_bytes_to_read {
+                let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
+                if let Some(segment) = segment {
+                    let buffer_length = buffer.len();
+                    let num_read = segment.read_bytes(address, &mut buffer, num_bytes_to_read - buffer_length);
+                    address += num_read;
+                } else {
+                    return Err(MemoryError::NotMapped)
+                }
+            }
+
+            let result = match size {
+                ValueSize::HALF => u8::from_le_bytes(buffer[..].try_into().unwrap()) as u64,
+                ValueSize::WORD => u16::from_le_bytes(buffer[..].try_into().unwrap()) as u64,
+                ValueSize::DOUBLE => u32::from_le_bytes(buffer[..].try_into().unwrap()) as u64,
+                ValueSize::QUAD => u64::from_le_bytes(buffer[..].try_into().unwrap())
+            };
+
+            Ok(result)
         } else {
             Err(MemoryError::Unaligned)
         }
@@ -252,27 +308,46 @@ impl Memory {
                 Err(MemoryError::NotMapped)
             }
         } else if allow_unaligned {
-            unimplemented!()
+            let mut data = match size {
+                ValueSize::HALF => (value as u8).to_le_bytes().to_vec(),
+                ValueSize::WORD => (value as u16).to_le_bytes().to_vec(),
+                ValueSize::DOUBLE => (value as u32).to_le_bytes().to_vec(),
+                ValueSize::QUAD => value.to_le_bytes().to_vec()
+            }.into_boxed_slice();
+
+            let mut address = address;
+            while data.len() > 0 {
+                let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
+                if let Some(segment) = segment {
+                    let num_written = segment.write_bytes(address, &*data, data.len());
+                    address += num_written;
+                    data = Box::from(&data[num_written..])
+                } else {
+                    return Err(MemoryError::NotMapped)
+                }
+            }
+
+            Ok(())
         } else {
             Err(MemoryError::Unaligned)
         }
     }
 
-    pub fn read_instruction_data(&self, instruction_pointer: usize) -> Result<VecDeque<u8>, String> {
-        let mut instruction_data: VecDeque<u8> = VecDeque::with_capacity(crate::cpu::MAX_INSTRUCTION_SIZE);
-        let mut memory_map_segment = self.memory_segments.iter().find(|x| instruction_pointer >= x.start && instruction_pointer - x.start < x.size);
-        while instruction_data.len() < crate::cpu::MAX_INSTRUCTION_SIZE {
-            if let Some(mms) = memory_map_segment {
-                let num_bytes = crate::cpu::MAX_INSTRUCTION_SIZE - instruction_data.len();
-                mms.read_instruction_bytes(instruction_pointer, &mut instruction_data, num_bytes);
-                memory_map_segment = self.memory_segments.iter().find(|x| x.start == mms.start.wrapping_add(mms.size));
+    pub fn read_instruction_data(&self, mut address: usize) -> Result<VecDeque<u8>, MemoryError> {
+        let num_bytes_to_read = MAX_INSTRUCTION_SIZE;
+        let mut buffer = Vec::with_capacity(num_bytes_to_read);
+        while buffer.len() < num_bytes_to_read {
+            let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
+            if let Some(segment) = segment {
+                let buffer_length = buffer.len();
+                let num_read = segment.read_bytes(address, &mut buffer, num_bytes_to_read - buffer_length);
+                address += num_read;
             } else {
-                return Err(format!("Accessed unmapped memory segment at address {}", instruction_pointer))
+                // if we encounter an unmapped memory segment, we should stop reading since it might not be a problem
+                break
             }
         }
 
-        // instruction_data.len() <= MAX_INSTRUCTION_SIZE
-
-        Ok(instruction_data)
+        Ok(VecDeque::from(buffer))
     }
 }
