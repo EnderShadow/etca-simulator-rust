@@ -1,9 +1,7 @@
-use std::cell::RefCell;
-use std::cmp::min;
 use std::collections::VecDeque;
-use std::fmt::format;
-use std::rc::Rc;
 use crate::mem::{Memory, MemoryError};
+
+use bitmatch::bitmatch;
 
 macro_rules! expect_set {
     ($x:expr, $y:expr, $msg:expr) => {
@@ -283,6 +281,26 @@ impl CPUState {
     }
 }
 
+#[derive(Copy, Clone)]
+struct REX {
+    q: bool,
+    a: bool,
+    b: bool,
+    x: bool
+}
+
+impl REX {
+    fn new(value: u8) -> REX {
+        REX {
+            q: value & 8 != 0,
+            a: value & 4 != 0,
+            b: value & 2 != 0,
+            x: value & 1 != 0
+        }
+    }
+}
+
+#[bitmatch]
 pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) -> Result<CPUState, String> {
     // instruction_data is assumed to be contiguous since data is never added to it after read_instruction_data returns
     let mut instruction_data = memory.read_instruction_data(cpu_state.instruction_pointer).unwrap();
@@ -319,198 +337,251 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
         instruction_size += 1;
     }
 
-    let rex = rex.unwrap_or(0);
+    let rex = REX::new(rex.unwrap_or(0));
 
     // prefixes have been parsed
-
-    // check for single byte NOP
 
     if instruction_data.len() < 1 {
         return Err(format!("No data at address {}", cpu_state.instruction_pointer))
     }
 
-    // there is technically nothing preventing this from being implemented without a VWI extension
-    if (cpu_info.force_allow_single_byte_nop || cpu_info.cpuid_1 & 0x2031 != 0 || cpu_info.cpuid_2 & 0x3 != 0) && instruction_data[0] == 0b1010_1110 {
-        // condition code does not matter since a skipped nop is the same as an executed nop
-        cpu_state.instruction_pointer += instruction_size + 1;
-        return Ok(cpu_state)
-    }
-
-    if instruction_data.len() < 2 {
-        return Err(format!("No data at address {}", cpu_state.instruction_pointer))
-    }
-
-    // check for base-isa jump
-
-    {
-        let jump_instr = u16::from_le_bytes(instruction_data.as_slices().0[0..2].try_into().unwrap());
-        if jump_instr & 0xE0 == 0b1000_0000 {
-            // cache instructions in the non-canonical NOP section are ignored since there is no cache
-            return if condition_code.is_some() {
-                Err(format!("Invalid instruction at address {}. Cannot use condition prefix with conditional jumps", cpu_state.instruction_pointer))
-            } else {
-                let condition_code = (jump_instr & 0xF) as u8;
-                let offset = if jump_instr & 0x10 != 0 {
-                    (jump_instr >> 8) as usize | !255usize
+    let first_byte = instruction_data[0];
+    #[bitmatch]
+    match first_byte {
+        "0???_????" => {
+            let used_bytes = handle_base_operations(&mut cpu_state, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex)?;
+            cpu_state.instruction_pointer += instruction_size + used_bytes;
+            Ok(cpu_state)
+        }
+        "100?_????" => {
+            // base isa relative immediate jump
+            if instruction_data.len() >= 2 && condition_code.is_none() {
+                // cache instructions in the non-canonical NOP section are ignored since there is no cache
+                let condition_code = first_byte & 0xF;
+                let displacement = instruction_data[1] as usize;
+                let offset = if first_byte & 0x10 != 0 {
+                    displacement | !255usize
                 } else {
-                    (jump_instr >> 8) as usize
+                    displacement
                 };
                 if check_condition(condition_code, cpu_state.cr_flags) {
                     cpu_state.instruction_pointer = cpu_state.instruction_pointer.wrapping_add(offset);
                 } else {
                     cpu_state.instruction_pointer += instruction_size + 2;
                 }
-                Ok(cpu_state)
+                return Ok(cpu_state)
+            } else if instruction_data.len() < 2 {
+                todo!("Handle exceptional situation")
+            } else {
+                todo!("Handle exceptional situation")
             }
         }
-    }
-
-    // check for SAF reg jump/call
-
-    {
-        let saf_reg_jump_call = u16::from_le_bytes(instruction_data.as_slices().0[0..2].try_into().unwrap());
-        if cpu_info.cpuid_1 & CP1_SAF != 0 && saf_reg_jump_call & 0xFF == 0b1010_1111 {
-            if condition_code.is_some() {
-                return Err(format!("Invalid instruction at address {}. Cannot use a condition prefix with conditional jumps/calls", cpu_state.instruction_pointer))
-            }
-
-            let call = saf_reg_jump_call & 0x1000 != 0;
-            let condition_code = ((saf_reg_jump_call >> 8) & 0xF) as u8;
-            let register_index = if rex & 0x4 != 0 {
-                ((saf_reg_jump_call >> 13) & 0x7) | 8
-            } else {
-                (saf_reg_jump_call >> 13) & 0x7
-            } as usize;
-
-            if check_condition(condition_code, cpu_state.cr_flags) {
-                if call {
-                    cpu_state.registers[7].value = (cpu_state.instruction_pointer + instruction_size + 2) as u64;
-                }
-                cpu_state.instruction_pointer = cpu_state.registers[register_index].value as usize;
-            } else {
-                cpu_state.instruction_pointer += instruction_size + 2;
-            }
-
-            return Ok(cpu_state)
+        "1010_0???" => {
+            todo!("Illegal instruction")
         }
-    }
-
-    // check for SAF immediate call
-
-    {
-        let saf_imm_call = u16::from_le_bytes(instruction_data.as_slices().0[0..2].try_into().unwrap());
-        if cpu_info.cpuid_1 & CP1_SAF != 0 && saf_imm_call & 0xF0 == 0b1011_0000 {
-            let displacement = ((saf_imm_call >> 8) | ((saf_imm_call & 0xF) << 8)) as usize;
-            let displacement = if displacement & 0x800 != 0 {
-                displacement | !0xFFF
-            } else {
-                displacement
-            };
-
-            cpu_state.registers[7].value = (cpu_state.instruction_pointer + instruction_size + 2) as u64;
-            cpu_state.instruction_pointer = cpu_state.instruction_pointer.wrapping_add(displacement);
-
-            return Ok(cpu_state)
+        "1010_10??" => {
+            todo!("Illegal instruction")
         }
-    }
+        "1010_110?" => {
+            todo!("Illegal instruction")
+        }
+        "1010_1110" => {
+            // single byte NOP
 
-    // check for base register-immediate instructions
-
-    {
-        let base_reg_imm = u16::from_le_bytes(instruction_data.as_slices().0[0..2].try_into().unwrap());
-        if base_reg_imm & 0xC0 == 0b0100_0000 && base_reg_imm & 0xF != 0b1101{
-            let operation = base_reg_imm & 0xF;
-            let size = ValueSize::from_u8(((base_reg_imm >> 4) & 0x3) as u8);
-            let immediate = ((base_reg_imm >> 8) & 0x1F) as u64;
-            let immediate = if (operation < 8 || operation == 9) && immediate & 0x10 != 0 {
-                immediate | !0x1F
+            // there is technically nothing preventing this from being implemented without a VWI extension
+            if cpu_info.force_allow_single_byte_nop || cpu_info.cpuid_1 & 0x2031 != 0 || cpu_info.cpuid_2 & 0x3 != 0 {
+                // condition code does not matter since a skipped nop is the same as an executed nop
+                cpu_state.instruction_pointer += instruction_size + 1;
+                return Ok(cpu_state)
             } else {
-                immediate
-            };
-            let register_index = if rex & 0x4 != 0 {
-                ((base_reg_imm >> 13) & 0x7) | 8
-            } else {
-                (base_reg_imm >> 13) & 0x7
-            } as usize;
+                todo!()
+            }
+        }
+        "1010_1111" => {
+            // SAF register jump/call
+            if instruction_data.len() >= 2 && cpu_info.cpuid_1 & CP1_SAF != 0 {
+                if condition_code.is_none() {
+                    let second_byte = instruction_data[1];
+                    let call = second_byte & 0x10 != 0;
+                    let condition_code = second_byte & 0xF;
+                    let register_index = if rex.a {
+                        (second_byte >> 5) | 8
+                    } else {
+                        second_byte >> 5
+                    } as usize;
 
-            let register = &mut cpu_state.registers[register_index];
-
-            if operation < 8 {
-                let (result, flags) = perform_base_operation(operation as u64, register.read(cpu_info, size), immediate, size);
-                if let Some(result) = result {
-                    register.write(cpu_info, size, true, result)
-                }
-                cpu_state.cr_flags = flags
-            } else {
-                match operation {
-                    8 => {
-                        // movz
-                        register.write(cpu_info, size, false, immediate);
-                    }
-                    9 => {
-                        // movs
-                        register.write(cpu_info, size, true, immediate);
-                    }
-                    10 => {
-                        // load
-                        let address = cpu_state.address_width().sign_extend(immediate) as usize;
-                        let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0);
-                        // need to drop the mutable reference to grab the address width from cpu_state
-                        let register = &mut cpu_state.registers[register_index];
-                        match data {
-                            Ok(data) => {
-                                register.write(cpu_info, size, true, data);
-                            }
-                            Err(MemoryError::Unaligned) => {
-                                return Err("Attempted to read from an unaligned memory address".to_string())
-                            }
-                            Err(MemoryError::NotMapped) => {
-                                return Err("Attempted to read from unmapped memory".to_string())
-                            }
+                    if check_condition(condition_code, cpu_state.cr_flags) {
+                        if call {
+                            cpu_state.registers[7].value = (cpu_state.instruction_pointer + instruction_size + 2) as u64;
                         }
+                        cpu_state.instruction_pointer = cpu_state.registers[register_index].value as usize;
+                    } else {
+                        cpu_state.instruction_pointer += instruction_size + 2;
                     }
-                    11 => {
-                        // store
-                        let value = register.read(cpu_info, size);
-                        let address = cpu_state.address_width().sign_extend(immediate) as usize;
-                        let result = memory.write(address, size, value, cpu_info.feat & FT_UMA != 0);
-                        match result {
-                            Ok(()) => {}
-                            Err(MemoryError::Unaligned) => {
-                                return Err("Attempted to write to an unaligned memory address".to_string())
-                            }
-                            Err(MemoryError::NotMapped) => {
-                                return Err("Attempted to write to an unmapped memory address".to_string())
-                            }
-                        }
-                    }
-                    12 => {
-                        // slo
-                        let new_value = (register.read(cpu_info, size) << 5) | immediate;
-                        register.write(cpu_info, size, true, new_value);
-                    }
-                    14 => {
-                        let data = read_cr(&mut cpu_state, cpu_info, immediate as usize);
 
-                        if let Some(data) = data {
-                            // needed to drop the old reference before calling read_cr
-                            let register = &mut cpu_state.registers[register_index];
-                            register.write(cpu_info, size, true, data);
-                        }
+                    return Ok(cpu_state)
+                } else {
+                    todo!("Handle exceptional situation")
+                }
+            } else if instruction_data.len() < 2 {
+                todo!("Handle exceptional situation")
+            } else {
+                todo!("Handle exceptional situation")
+            }
+        }
+        "1011_????" => {
+            // SAF relative immediate call
+            if instruction_data.len() >= 2 && cpu_info.cpuid_1 & CP1_SAF != 0 {
+                let second_byte = instruction_data[1];
+                let displacement = second_byte as usize | ((first_byte as usize & 0xF) << 8);
+                let displacement = if displacement & 0x800 != 0 {
+                    displacement | !0xFFF
+                } else {
+                    displacement
+                };
+
+                cpu_state.registers[7].value = (cpu_state.instruction_pointer + instruction_size + 2) as u64;
+                cpu_state.instruction_pointer = cpu_state.instruction_pointer.wrapping_add(displacement);
+
+                return Ok(cpu_state)
+            } else if instruction_data.len() < 2 {
+                todo!("Handle exceptional situation")
+            } else {
+                todo!("Handle exceptional situation")
+            }
+        }
+        "110?_????" => {
+            todo!("Illegal instruction")
+        }
+        "1110_????" => {
+            let result = handle_exop_operations(&mut cpu_state, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex);
+            todo!()
+        }
+        "1111_????" => {
+            let result = handle_exop_jump_call(&mut cpu_state, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex);
+            todo!()
+        }
+    }
+}
+
+fn handle_base_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize, String> {
+    let first_byte = instruction_data[0];
+    if first_byte & 0x40 == 0 {
+        let second_byte = instruction_data[1];
+        if second_byte & 0x3 == 0 {
+            handle_base_register_operation(cpu_state, cpu_info, memory, instruction_data, condition_code, rex)
+        } else {
+            handle_base_mem_operation(cpu_state, cpu_info, memory, instruction_data, condition_code, rex)
+        }
+    } else {
+        handle_base_immediate_operation(cpu_state, cpu_info, memory, instruction_data, condition_code, rex)
+    }
+}
+
+fn handle_base_register_operation(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize, String> {
+    unimplemented!()
+}
+
+fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize, String> {
+    let first_byte = instruction_data[0];
+    let second_byte = instruction_data[1];
+    let operation = first_byte & 0xF;
+    let size = ValueSize::from_u8((first_byte >> 4) & 0x3);
+    let immediate = (second_byte & 0x1F) as u64;
+    let immediate = if (operation < 8 || operation == 9) && immediate & 0x10 != 0 {
+        immediate | !0x1F
+    } else {
+        immediate
+    };
+    let register_index = if rex.a {
+        ((second_byte >> 5) & 0x7) | 8
+    } else {
+        (second_byte >> 5) & 0x7
+    } as usize;
+
+    let register = &mut cpu_state.registers[register_index];
+
+    if operation < 8 {
+        let (result, flags) = perform_base_operation(operation as u64, register.read(cpu_info, size), immediate, size);
+        if let Some(result) = result {
+            register.write(cpu_info, size, true, result)
+        }
+        cpu_state.cr_flags = flags
+    } else {
+        match operation {
+            8 => {
+                // movz
+                register.write(cpu_info, size, false, immediate);
+            }
+            9 => {
+                // movs
+                register.write(cpu_info, size, true, immediate);
+            }
+            10 => {
+                // load
+                let address = cpu_state.address_width().sign_extend(immediate) as usize;
+                let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0);
+                // need to drop the mutable reference to grab the address width from cpu_state
+                let register = &mut cpu_state.registers[register_index];
+                match data {
+                    Ok(data) => {
+                        register.write(cpu_info, size, true, data);
                     }
-                    15 => {
-                        let data = register.read(cpu_info, size);
-                        write_cr(&mut cpu_state, cpu_info, immediate as usize, data);
+                    Err(MemoryError::Unaligned) => {
+                        return Err("Attempted to read from an unaligned memory address".to_string())
                     }
-                    _ => unreachable!()
+                    Err(MemoryError::NotMapped) => {
+                        return Err("Attempted to read from unmapped memory".to_string())
+                    }
                 }
             }
+            11 => {
+                // store
+                let value = register.read(cpu_info, size);
+                let address = cpu_state.address_width().sign_extend(immediate) as usize;
+                let result = memory.write(address, size, value, cpu_info.feat & FT_UMA != 0);
+                match result {
+                    Ok(()) => {}
+                    Err(MemoryError::Unaligned) => {
+                        return Err("Attempted to write to an unaligned memory address".to_string())
+                    }
+                    Err(MemoryError::NotMapped) => {
+                        return Err("Attempted to write to an unmapped memory address".to_string())
+                    }
+                }
+            }
+            12 => {
+                // slo
+                let new_value = (register.read(cpu_info, size) << 5) | immediate;
+                register.write(cpu_info, size, true, new_value);
+            }
+            13 => {
+                todo!()
+            }
+            14 => {
+                // readcr
+                let data = read_cr(&mut cpu_state, cpu_info, immediate as usize);
 
-            return Ok(cpu_state)
+                if let Some(data) = data {
+                    // needed to drop the old reference before calling read_cr
+                    let register = &mut cpu_state.registers[register_index];
+                    register.write(cpu_info, size, true, data);
+                }
+            }
+            15 => {
+                // writecr
+                let data = register.read(cpu_info, size);
+                write_cr(&mut cpu_state, cpu_info, immediate as usize, data);
+            }
+            _ => unreachable!()
         }
     }
 
-    Err(format!("Invalid instruction at address {}.", cpu_state.instruction_pointer))
+    Ok(2)
+}
+
+fn handle_base_mem_operation(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize, String> {
+    todo!()
 }
 
 fn perform_base_operation(operation: u64, input_a: u64, input_b: u64, size: ValueSize) -> (Option<u64>, u8) {
@@ -777,6 +848,14 @@ fn write_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize, data: u6
         }
         _ => {}
     }
+}
+
+fn handle_exop_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<(), String> {
+    unimplemented!()
+}
+
+fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<(), String> {
+    unimplemented!()
 }
 
 fn check_condition(condition_code: u8, flags: u8) -> bool {

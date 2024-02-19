@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 range-ext = "0.3.0"
+bitmatch = "0.1.1"
