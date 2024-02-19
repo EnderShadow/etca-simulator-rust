@@ -351,8 +351,6 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
         "0???_????" => {
             let used_bytes = handle_base_operations(&mut cpu_state, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex)?;
             cpu_state.instruction_pointer += instruction_size + used_bytes;
-
-            Ok(cpu_state)
         }
         "100?_????" => {
             // base isa relative immediate jump
@@ -370,7 +368,6 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
                 } else {
                     cpu_state.instruction_pointer += instruction_size + 2;
                 }
-                return Ok(cpu_state)
             } else if instruction_data.len() < 2 {
                 todo!("Handle exceptional situation")
             } else {
@@ -393,7 +390,6 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
             if cpu_info.force_allow_single_byte_nop || cpu_info.cpuid_1 & 0x2031 != 0 || cpu_info.cpuid_2 & 0x3 != 0 {
                 // condition code does not matter since a skipped nop is the same as an executed nop
                 cpu_state.instruction_pointer += instruction_size + 1;
-                return Ok(cpu_state)
             } else {
                 todo!()
             }
@@ -419,8 +415,6 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
                     } else {
                         cpu_state.instruction_pointer += instruction_size + 2;
                     }
-
-                    return Ok(cpu_state)
                 } else {
                     todo!("Handle exceptional situation")
                 }
@@ -443,8 +437,6 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
 
                 cpu_state.registers[7].value = (cpu_state.instruction_pointer + instruction_size + 2) as u64;
                 cpu_state.instruction_pointer = cpu_state.instruction_pointer.wrapping_add(displacement);
-
-                return Ok(cpu_state)
             } else if instruction_data.len() < 2 {
                 todo!("Handle exceptional situation")
             } else {
@@ -455,16 +447,18 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
             todo!("Illegal instruction")
         }
         "1110_????" => {
-            let result = handle_exop_operations(&mut cpu_state, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex);
+            let used_bytes = handle_exop_operations(&mut cpu_state, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex)?;
             todo!()
         }
         "1111_????" => {
             let used_bytes = handle_exop_jump_call(&mut cpu_state, cpu_info, &mut instruction_data, condition_code.unwrap_or(0xE))?;
             cpu_state.instruction_pointer += instruction_size + used_bytes;
-
-            Ok(cpu_state)
         }
     }
+
+    cpu_state.instruction_pointer = cpu_state.address_width().sign_extend(cpu_state.instruction_pointer as u64) as usize;
+
+    Ok(cpu_state)
 }
 
 fn handle_base_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize, String> {
