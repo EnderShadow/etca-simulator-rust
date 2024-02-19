@@ -3,7 +3,7 @@ use std::cmp::min;
 use std::collections::VecDeque;
 use std::fmt::format;
 use std::rc::Rc;
-use crate::mem::Memory;
+use crate::mem::{Memory, MemoryError};
 
 macro_rules! expect_set {
     ($x:expr, $y:expr, $msg:expr) => {
@@ -414,7 +414,369 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
         }
     }
 
+    // check for base register-immediate instructions
+
+    {
+        let base_reg_imm = u16::from_le_bytes(instruction_data.as_slices().0[0..2].try_into().unwrap());
+        if base_reg_imm & 0xC0 == 0b0100_0000 && base_reg_imm & 0xF != 0b1101{
+            let operation = base_reg_imm & 0xF;
+            let size = ValueSize::from_u8(((base_reg_imm >> 4) & 0x3) as u8);
+            let immediate = ((base_reg_imm >> 8) & 0x1F) as u64;
+            let immediate = if (operation < 8 || operation == 9) && immediate & 0x10 != 0 {
+                immediate | !0x1F
+            } else {
+                immediate
+            };
+            let register_index = if rex & 0x4 != 0 {
+                ((base_reg_imm >> 13) & 0x7) | 8
+            } else {
+                (base_reg_imm >> 13) & 0x7
+            } as usize;
+
+            let register = &mut cpu_state.registers[register_index];
+
+            if operation < 8 {
+                let (result, flags) = perform_base_operation(operation as u64, register.read(cpu_info, size), immediate, size);
+                if let Some(result) = result {
+                    register.write(cpu_info, size, true, result)
+                }
+                cpu_state.cr_flags = flags
+            } else {
+                match operation {
+                    8 => {
+                        // movz
+                        register.write(cpu_info, size, false, immediate);
+                    }
+                    9 => {
+                        // movs
+                        register.write(cpu_info, size, true, immediate);
+                    }
+                    10 => {
+                        // load
+                        let address = cpu_state.address_width().sign_extend(immediate) as usize;
+                        let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0);
+                        // need to drop the mutable reference to grab the address width from cpu_state
+                        let register = &mut cpu_state.registers[register_index];
+                        match data {
+                            Ok(data) => {
+                                register.write(cpu_info, size, true, data);
+                            }
+                            Err(MemoryError::Unaligned) => {
+                                return Err("Attempted to read from an unaligned memory address".to_string())
+                            }
+                            Err(MemoryError::NotMapped) => {
+                                return Err("Attempted to read from unmapped memory".to_string())
+                            }
+                        }
+                    }
+                    11 => {
+                        // store
+                        let value = register.read(cpu_info, size);
+                        let address = cpu_state.address_width().sign_extend(immediate) as usize;
+                        let result = memory.write(address, size, value, cpu_info.feat & FT_UMA != 0);
+                        match result {
+                            Ok(()) => {}
+                            Err(MemoryError::Unaligned) => {
+                                return Err("Attempted to write to an unaligned memory address".to_string())
+                            }
+                            Err(MemoryError::NotMapped) => {
+                                return Err("Attempted to write to an unmapped memory address".to_string())
+                            }
+                        }
+                    }
+                    12 => {
+                        // slo
+                        let new_value = (register.read(cpu_info, size) << 5) | immediate;
+                        register.write(cpu_info, size, true, new_value);
+                    }
+                    14 => {
+                        let data = read_cr(&mut cpu_state, cpu_info, immediate as usize);
+
+                        if let Some(data) = data {
+                            // needed to drop the old reference before calling read_cr
+                            let register = &mut cpu_state.registers[register_index];
+                            register.write(cpu_info, size, true, data);
+                        }
+                    }
+                    15 => {
+                        let data = register.read(cpu_info, size);
+                        write_cr(&mut cpu_state, cpu_info, immediate as usize, data);
+                    }
+                    _ => unreachable!()
+                }
+            }
+
+            return Ok(cpu_state)
+        }
+    }
+
     Err(format!("Invalid instruction at address {}.", cpu_state.instruction_pointer))
+}
+
+fn perform_base_operation(operation: u64, input_a: u64, input_b: u64, size: ValueSize) -> (Option<u64>, u8) {
+    match operation {
+        0 => {
+            let result = size.sign_extend(input_a.wrapping_add(input_b));
+            let flags = calculate_flags(input_a, input_b, result, size);
+
+            (Some(result), flags)
+        }
+        1 => {
+            let result = size.sign_extend(input_a.wrapping_sub(input_b));
+            let flags = calculate_flags(input_a, !input_b, result, size);
+
+            (Some(result), flags)
+        }
+        2 => {
+            let result = size.sign_extend(input_b.wrapping_sub(input_a));
+            let flags = calculate_flags(input_b, !input_a, result, size);
+
+            (Some(result), flags)
+        }
+        3 => {
+            let result = size.sign_extend(input_a.wrapping_sub(input_b));
+            let flags = calculate_flags(input_a, !input_b, result, size);
+
+            (None, flags)
+        }
+        4 => {
+            let result = size.sign_extend(input_a | input_b);
+            let flags = calculate_flags(input_a, input_b, result, size);
+
+            (Some(result), flags)
+        }
+        5 => {
+            let result = size.sign_extend(input_a ^ input_b);
+            let flags = calculate_flags(input_a, input_b, result, size);
+
+            (Some(result), flags)
+        }
+        6 => {
+            let result = size.sign_extend(input_a & input_b);
+            let flags = calculate_flags(input_a, input_b, result, size);
+
+            (Some(result), flags)
+        }
+        7 => {
+            let result = size.sign_extend(input_a & input_b);
+            let flags = calculate_flags(input_a, input_b, result, size);
+
+            (None, flags)
+        }
+        x => unreachable!("Invalid operation {x}")
+    }
+}
+
+fn calculate_flags(input_a: u64, input_b: u64, result: u64, size: ValueSize) -> u8 {
+    let mut flags = 0;
+    let mask = size.mask();
+    let msb = size.get_msb();
+
+    if result == 0 {
+        flags |= 1;
+    }
+    if result & msb != 0 {
+        flags |= 2;
+    }
+    if result & mask < input_a & mask {
+        flags |= 4;
+    }
+    if input_a & msb == input_b & msb && input_a & msb != result & msb {
+        flags |= 8;
+    }
+
+    flags
+}
+
+// Since cr_priv is initialized to 1 (system mode) and only matters when PM is implemented, it's ok to not check for the existence of PM.
+// Also, since reading from and writing to reserved CRs is unspecified behavior, treating PM as implemented doesn't cause any issues since
+// the only way to make it not 1 on a system without PM is to write to a reserved CR.
+fn read_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize) -> Option<u64> {
+    match index {
+        0 => Some(cpu_info.cpuid_1),
+        1 => Some(cpu_info.cpuid_2),
+        2 => Some(cpu_info.feat),
+        3 => Some(cpu_state.cr_flags as u64),
+        4 => {
+            if cpu_state.cr_priv == 1 {
+                Some(cpu_state.cr_int_pc as u64)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        5 => {
+            if cpu_state.cr_priv == 1 {
+                Some(cpu_state.cr_int_ret_pc as u64)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        6 => {
+            if cpu_state.cr_priv == 1 {
+                Some(cpu_state.cr_int_mask)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        7 => {
+            if cpu_state.cr_priv == 1 {
+                Some(cpu_state.cr_int_pending)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        8 => {
+            if cpu_state.cr_priv == 1 {
+                Some(cpu_state.cr_int_cause)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        9 => {
+            if cpu_state.cr_priv == 1 {
+                Some(cpu_state.cr_int_data)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        10 => {
+            if cpu_state.cr_priv == 1 {
+                Some(cpu_state.cr_int_scratch_0)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        11 => {
+            if cpu_state.cr_priv == 1 {
+                Some(cpu_state.cr_int_scratch_1)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        12 => {
+            Some(cpu_state.cr_priv as u64)
+        }
+        13 => {
+            if cpu_state.cr_priv == 1 {
+                Some(cpu_state.cr_int_ret_priv as u64)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        14 => {
+            Some(cpu_state.cr_cache_line_size as u64)
+        }
+        15 => {
+            if cpu_state.cr_priv == 1 {
+                Some(cpu_state.cr_no_cache_start as u64)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        16 => {
+            if cpu_state.cr_priv == 1 {
+                Some(cpu_state.cr_no_cache_end as u64)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        17 => {
+            Some(cpu_state.cr_address_mode as u64)
+        }
+        _ => Some(0)
+    }
+}
+
+fn write_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize, data: u64) {
+    match index {
+        0..=2 => {}
+        3 => cpu_state.cr_flags = data as u8,
+        4 => {
+            if cpu_state.cr_priv == 1 {
+                cpu_state.cr_int_pc = data as usize
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        5 => {
+            if cpu_state.cr_priv == 1 {
+                cpu_state.cr_int_ret_pc = data as usize
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        6 => {
+            if cpu_state.cr_priv == 1 {
+                cpu_state.cr_int_mask = data
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        7 => {
+            if cpu_state.cr_priv == 0 {
+                todo!("Handle exceptional state")
+            }
+        }
+        8 => {
+            if cpu_state.cr_priv == 0 {
+                todo!("Handle exceptional state")
+            }
+        }
+        9 => {
+            if cpu_state.cr_priv == 0 {
+                todo!("Handle exceptional state")
+            }
+        }
+        10 => {
+            if cpu_state.cr_priv == 1 {
+                cpu_state.cr_int_scratch_0 = data
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        11 => {
+            if cpu_state.cr_priv == 1 {
+                cpu_state.cr_int_scratch_1 = data
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        12 => {
+            if cpu_state.cr_priv == 1 {
+                cpu_state.cr_priv = (data & 1) as u8
+            }
+        }
+        13 => {
+            if cpu_state.cr_priv == 1 {
+                cpu_state.cr_int_ret_priv = (data & 1) as u8
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        14 => {}
+        15 => {
+            if cpu_state.cr_priv == 1 {
+                cpu_state.cr_no_cache_start = (data as usize) & !(CACHE_LINE_SIZE - 1)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        16 => {
+            if cpu_state.cr_priv == 1 {
+                cpu_state.cr_no_cache_end = (data as usize) & !(CACHE_LINE_SIZE - 1)
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        17 => {
+            if cpu_state.cr_priv == 1 {
+                cpu_state.cr_address_mode = data as u8
+            } else {
+                todo!("Handle exceptional state")
+            }
+        }
+        _ => {}
+    }
 }
 
 fn check_condition(condition_code: u8, flags: u8) -> bool {
