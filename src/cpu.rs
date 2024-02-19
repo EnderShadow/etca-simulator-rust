@@ -104,7 +104,7 @@ impl CPUInfo {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
 pub enum ValueSize {
     HALF,
     WORD,
@@ -351,6 +351,7 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
         "0???_????" => {
             let used_bytes = handle_base_operations(&mut cpu_state, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex)?;
             cpu_state.instruction_pointer += instruction_size + used_bytes;
+
             Ok(cpu_state)
         }
         "100?_????" => {
@@ -458,8 +459,10 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
             todo!()
         }
         "1111_????" => {
-            let result = handle_exop_jump_call(&mut cpu_state, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex);
-            todo!()
+            let used_bytes = handle_exop_jump_call(&mut cpu_state, cpu_info, &mut instruction_data, condition_code.unwrap_or(0xE))?;
+            cpu_state.instruction_pointer += instruction_size + used_bytes;
+
+            Ok(cpu_state)
         }
     }
 }
@@ -850,12 +853,68 @@ fn write_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize, data: u6
     }
 }
 
-fn handle_exop_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<(), String> {
+fn handle_exop_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize, String> {
     unimplemented!()
 }
 
-fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<(), String> {
-    unimplemented!()
+fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, instruction_data: &mut VecDeque<u8>, condition_code: u8) -> Result<usize, String> {
+    let address_width = cpu_state.address_width();
+    let first_byte = instruction_data[0];
+    let call = first_byte & 8 != 0;
+    let absolute = first_byte & 4 != 0;
+    let size = ValueSize::from_u8(first_byte & 3);
+    if (size == ValueSize::DOUBLE && address_width < ValueSize::DOUBLE) || (size == ValueSize::QUAD && address_width < ValueSize::QUAD) {
+        todo!("Handle invalid size jump for address mode")
+    }
+
+    let (immediate, read_bytes) = match size {
+        ValueSize::HALF => {
+            let value = if !absolute {
+                instruction_data[1] as usize | !(u8::MAX as usize)
+            } else {
+                instruction_data[1] as usize
+            };
+            (value, 2)
+        }
+        ValueSize::WORD => {
+            let value = u16::from_le_bytes(instruction_data.as_slices().0[1..3].try_into().unwrap()) as usize;
+            let value = if !absolute {
+                value | !(u16::MAX as usize)
+            } else {
+                value
+            };
+            (value, 3)
+        }
+        ValueSize::DOUBLE => {
+            let value = u32::from_le_bytes(instruction_data.as_slices().0[1..5].try_into().unwrap()) as usize;
+            let value = if !absolute {
+                value | !(u32::MAX as usize)
+            } else {
+                value
+            };
+            (value, 5)
+        }
+        ValueSize::QUAD => {
+            let value = u64::from_le_bytes(instruction_data.as_slices().0[1..9].try_into().unwrap()) as usize;
+            (value, 9)
+        }
+    };
+
+    if check_condition(condition_code, cpu_state.cr_flags) {
+        if call {
+            cpu_state.registers[7].write(cpu_info, address_width, true, cpu_state.instruction_pointer as u64)
+        }
+
+        cpu_state.instruction_pointer = if absolute {
+            (cpu_state.instruction_pointer & address_width.inverse_mask() as usize) | (immediate & address_width.mask() as usize)
+        } else {
+            cpu_state.instruction_pointer.wrapping_add(immediate)
+        };
+
+        Ok(0)
+    } else {
+        Ok(read_bytes)
+    }
 }
 
 fn check_condition(condition_code: u8, flags: u8) -> bool {
