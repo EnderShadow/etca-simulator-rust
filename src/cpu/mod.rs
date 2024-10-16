@@ -1,12 +1,17 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use crate::mem::{Memory, MemoryError};
 
 use bitmatch::bitmatch;
+use thiserror::Error;
+use crate::cpu::CPUError::{InvalidValueSize, MissingCapabilities, UnsupportedCapabilities};
+
+mod tests;
 
 macro_rules! expect_set {
-    ($x:expr, $y:expr, $msg:expr) => {
+    ($x:expr, $y:expr, $err:expr) => {
         if $x & $y != $y {
-            return Err($msg.into());
+            return Err($err.into());
         }
     }
 }
@@ -41,7 +46,21 @@ pub const ALL_FT: u64 = 0xF;
 
 pub const MAX_INSTRUCTION_SIZE: usize = 16;
 
-const CACHE_LINE_SIZE: usize = 8;
+const CACHE_LINE_SIZE: usize = 0;
+
+type Result<T> = std::result::Result<T, CPUError>;
+
+#[derive(Error, Debug)]
+pub enum CPUError {
+    #[error(transparent)]
+    Memory(#[from] MemoryError),
+    #[error("CPU cannot have capabilities or features unsupported by the simulator: {0}")]
+    UnsupportedCapabilities(String),
+    #[error("CPU is missing required capabilities or features: {0}")]
+    MissingCapabilities(String),
+    #[error("Invalid value for size: {0}")]
+    InvalidValueSize(u8)
+}
 
 pub struct CPUInfo {
     pub cpuid_1: u64,
@@ -52,46 +71,38 @@ pub struct CPUInfo {
 }
 
 impl CPUInfo {
-    pub fn new(cpuid_1: u64, cpuid_2: u64, feat: u64, force_allow_single_byte_nop: bool) -> Result<CPUInfo, String> {
-        expect_set!(ALL_CP1, cpuid_1, format!("CP1 has unknown bits set: {}", (ALL_CP1 & cpuid_1) ^ cpuid_1));
-        expect_set!(ALL_CP2, cpuid_2, format!("CP2 has unknown bits set: {}", (ALL_CP2 & cpuid_2) ^ cpuid_2));
-        expect_set!(ALL_FT, feat, format!("FT has unknown bits set: {}", (ALL_FT & feat) ^ feat));
+    pub fn new(cpuid_1: u64, cpuid_2: u64, feat: u64, force_allow_single_byte_nop: bool) -> Result<CPUInfo> {
+        expect_set!(ALL_CP1, cpuid_1, UnsupportedCapabilities(format!("CP1 has unknown bits set: {}", (ALL_CP1 & cpuid_1) ^ cpuid_1)));
+        expect_set!(ALL_CP2, cpuid_2, UnsupportedCapabilities(format!("CP2 has unknown bits set: {}", (ALL_CP2 & cpuid_2) ^ cpuid_2)));
+        expect_set!(ALL_FT, feat, UnsupportedCapabilities(format!("FT has unknown bits set: {}", (ALL_FT & feat) ^ feat)));
 
         if cpuid_1 & CP1_INT != 0 {
-            expect_set!(cpuid_1, CP1_SAF, "Interrupt extension requires Stack and Functions extension");
-            expect_set!(feat, FT_VON, "Interrupt extension requires Von Neumann feature");
+            expect_set!(cpuid_1, CP1_SAF, MissingCapabilities("Interrupt extension requires Stack and Functions extension".to_string()));
+            expect_set!(feat, FT_VON, MissingCapabilities("Interrupt extension requires Von Neumann feature".to_string()));
         }
 
         if cpuid_1 & CP1_ASP != 0 {
-            expect_set!(cpuid_1, CP1_SAF, "Arbitrary Stack Pointer extension requires Stack and Functions extension");
+            expect_set!(cpuid_1, CP1_SAF, MissingCapabilities("Arbitrary Stack Pointer extension requires Stack and Functions extension".to_string()));
         }
 
         if cpuid_1 & CP1_DWAS != 0 {
-            expect_set!(cpuid_1, CP1_DW, "Double Word Address Space extension requires Double Word extension");
+            expect_set!(cpuid_1, CP1_DW, MissingCapabilities("Double Word Address Space extension requires Double Word extension".to_string()));
         }
 
         if cpuid_1 & CP1_QWAS != 0 {
-            expect_set!(cpuid_1, CP1_QW, "Quad Word Address Space extension requires Quad Word extension");
+            expect_set!(cpuid_1, CP1_QW, MissingCapabilities("Quad Word Address Space extension requires Quad Word extension".to_string()));
         }
 
         if cpuid_2 & CP2_PM != 0 {
-            expect_set!(cpuid_1, CP1_INT, "Privileged Mode extension requires Interrupt extension");
+            expect_set!(cpuid_1, CP1_INT, MissingCapabilities("Privileged Mode extension requires Interrupt extension".to_string()));
         }
 
         if cpuid_2 & CP2_MD != 0 {
-            expect_set!(cpuid_2, CP2_EXOP, "Multiply Divide extension requires Expanded Opcodes extension");
+            expect_set!(cpuid_2, CP2_EXOP, MissingCapabilities("Multiply Divide extension requires Expanded Opcodes extension".to_string()));
         }
 
         if feat & FT_MMAI != 0 && cpuid_1 & CP1_MO2 == 0 && cpuid_2 & CP2_MO1 == 0 {
             println!("INFO: Multiple Memory Access Instructions feature is useless without Memory Operands 1 or Memory Operands 2 extension");
-        }
-
-        let invalid_cp1 = cpuid_1 & !ALL_CP1;
-        let invalid_cp2 = cpuid_2 & !ALL_CP2;
-        let invalid_ft = feat & !ALL_FT;
-
-        if invalid_cp1 != 0 || invalid_cp2 != 0 || invalid_ft != 0 {
-            return Err(format!("Unsupported extension(s) and/or feature(s) detected ({invalid_cp1}, {invalid_cp2}, {invalid_ft})"))
         }
 
         Ok(CPUInfo {
@@ -113,15 +124,15 @@ pub enum ValueSize {
 }
 
 impl TryFrom<u8> for ValueSize {
-    type Error = String;
+    type Error = CPUError;
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
+    fn try_from(value: u8) -> Result<Self> {
         match value {
             0 => Ok(ValueSize::HALF),
             1 => Ok(ValueSize::WORD),
             2 => Ok(ValueSize::DOUBLE),
             3 => Ok(ValueSize::QUAD),
-            x => Err(format!("Invalid value for size: {x}"))
+            x => Err(InvalidValueSize(x))
         }
     }
 }
@@ -133,7 +144,7 @@ impl ValueSize {
     }
 
     #[inline]
-    pub fn mask(&self) -> u64 {
+    pub const fn mask(&self) -> u64 {
         match self {
             ValueSize::HALF => 0xFF,
             ValueSize::WORD => 0xFFFF,
@@ -143,7 +154,7 @@ impl ValueSize {
     }
 
     #[inline]
-    pub fn inverse_mask(&self) -> u64 {
+    pub const fn inverse_mask(&self) -> u64 {
         match self {
             ValueSize::HALF => !0xFFu64,
             ValueSize::WORD => !0xFFFFu64,
@@ -153,7 +164,7 @@ impl ValueSize {
     }
 
     #[inline]
-    pub fn is_supported(&self, cpu_info: &CPUInfo) -> bool {
+    pub const fn is_supported(&self, cpu_info: &CPUInfo) -> bool {
         match self {
             ValueSize::HALF => cpu_info.cpuid_1 & CP1_BYTE != 0,
             ValueSize::WORD => true,
@@ -163,7 +174,7 @@ impl ValueSize {
     }
 
     #[inline]
-    pub fn num_bytes(&self) -> usize {
+    pub const fn num_bytes(&self) -> usize {
         match self {
             ValueSize::HALF => 1,
             ValueSize::WORD => 2,
@@ -173,7 +184,7 @@ impl ValueSize {
     }
 
     #[inline]
-    pub fn is_aligned(&self, address: usize) -> bool {
+    pub const fn is_aligned(&self, address: usize) -> bool {
         match self {
             ValueSize::HALF => true,
             ValueSize::WORD => address & 1 == 0,
@@ -183,7 +194,7 @@ impl ValueSize {
     }
 
     #[inline]
-    pub fn sign_extend(&self, value: u64) -> u64 {
+    pub const fn sign_extend(&self, value: u64) -> u64 {
         match self {
             ValueSize::HALF => (value as i8) as u64,
             ValueSize::WORD => (value as i16) as u64,
@@ -193,12 +204,12 @@ impl ValueSize {
     }
 
     #[inline]
-    pub fn zero_extend(&self, value: u64) -> u64 {
+    pub const fn zero_extend(&self, value: u64) -> u64 {
         value & self.mask()
     }
 
     #[inline]
-    pub fn get_msb(&self) -> u64 {
+    pub const fn get_msb(&self) -> u64 {
         match self {
             ValueSize::HALF => 0x80,
             ValueSize::WORD => 0x8000,
@@ -208,7 +219,10 @@ impl ValueSize {
     }
 }
 
-#[derive(Default)]
+const COND_ALWAYS: u8 = 0xE;
+const COND_NEVER: u8 = 0xF;
+
+#[derive(Default, Clone, Copy)]
 pub struct Register {
     value: u64
 }
@@ -218,6 +232,11 @@ impl Register {
         Register {
             value
         }
+    }
+
+    #[cfg(test)]
+    pub fn value(&self) -> u64 {
+        self.value
     }
 
     pub fn read(&self, cpu_info: &CPUInfo, size: ValueSize) -> u64 {
@@ -238,9 +257,9 @@ impl Register {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct CPUState {
-    registers: [Register; 16],
+    registers: [RefCell<Register>; 16],
     cr_flags: u8,
     cr_int_pc: usize,
     cr_int_ret_pc: usize,
@@ -264,10 +283,24 @@ impl CPUState {
         CPUState {
             cr_priv: 1,
             cr_cache_line_size: CACHE_LINE_SIZE,
-            cr_no_cache_end: usize::MAX & !(CACHE_LINE_SIZE - 1),
+            cr_no_cache_end: usize::MAX & !CACHE_LINE_SIZE.wrapping_sub(1),
             instruction_pointer: 0xFFFF_FFFF_FFFF_8000,
             .. CPUState::default()
         }
+    }
+
+    #[cfg(test)]
+    pub fn take_registers(self) -> [Register; 16] {
+        self.registers.map(|r| r.take())
+    }
+    
+    pub fn dump_values(&self) {
+        println!("Registers");
+        for (idx, register) in self.registers.iter().enumerate() {
+            println!("\tr{:02}: 0x{:016X}", idx, register.borrow().value)
+        }
+        
+        // todo Add more details
     }
 
     fn address_width(&self) -> ValueSize {
@@ -301,13 +334,17 @@ impl REX {
 }
 
 #[bitmatch]
-pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) -> Result<CPUState, String> {
+pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) -> Result<CPUState> {
     // instruction_data is assumed to be contiguous since data is never added to it after read_instruction_data returns
-    let mut instruction_data = memory.read_instruction_data(cpu_state.instruction_pointer).unwrap();
-    assert_eq!(instruction_data.as_slices().1.len(), 0, "instruction_data should be contiguous");
+    let instruction_data = memory.read_instruction_data(cpu_state.instruction_pointer);
+    let mut instruction_data = VecDeque::from(instruction_data);
 
     if instruction_data.len() < 1 {
-        return Err(format!("No data at address {}", cpu_state.instruction_pointer))
+        if cpu_info.cpuid_1 & CP1_INT != 0 {
+            todo!("General Protection Fault, no data at address")
+        } else {
+            return Err(CPUError::Memory(MemoryError::UnmappedMemory(cpu_state.instruction_pointer)))
+        }
     }
 
     let mut instruction_size = 0usize;
@@ -327,7 +364,11 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
     }
 
     if instruction_data.len() < 1 {
-        return Err(format!("No data at address {}", cpu_state.instruction_pointer))
+        if cpu_info.cpuid_1 & CP1_INT != 0 {
+            todo!("General Protection Fault, no data at address")
+        } else {
+            return Err(CPUError::Memory(MemoryError::UnmappedMemory(cpu_state.instruction_pointer + instruction_size)))
+        }
     }
 
     let prefix = instruction_data[0];
@@ -342,7 +383,11 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
     // prefixes have been parsed
 
     if instruction_data.len() < 1 {
-        return Err(format!("No data at address {}", cpu_state.instruction_pointer))
+        if cpu_info.cpuid_1 & CP1_INT != 0 {
+            todo!("General Protection Fault, no data at address")
+        } else {
+            return Err(CPUError::Memory(MemoryError::UnmappedMemory(cpu_state.instruction_pointer + instruction_size)))
+        }
     }
 
     let first_byte = instruction_data[0];
@@ -369,18 +414,23 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
                     cpu_state.instruction_pointer += instruction_size + 2;
                 }
             } else if instruction_data.len() < 2 {
+                // not enough bytes
                 todo!("Handle exceptional situation")
             } else {
-                todo!("Handle exceptional situation")
+                // conditional prefix on a conditional jump
+                todo!("Illegal instruction")
             }
         }
         "1010_0???" => {
+            // multiple conditional prefixes
             todo!("Illegal instruction")
         }
         "1010_10??" => {
+            // multiple conditional prefixes
             todo!("Illegal instruction")
         }
         "1010_110?" => {
+            // multiple conditional prefixes
             todo!("Illegal instruction")
         }
         "1010_1110" => {
@@ -391,7 +441,7 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
                 // condition code does not matter since a skipped nop is the same as an executed nop
                 cpu_state.instruction_pointer += instruction_size + 1;
             } else {
-                todo!()
+                todo!("Illegal instruction")
             }
         }
         "1010_1111" => {
@@ -409,19 +459,22 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
 
                     if check_condition(condition_code, cpu_state.cr_flags) {
                         if call {
-                            cpu_state.registers[7].value = (cpu_state.instruction_pointer + instruction_size + 2) as u64;
+                            cpu_state.registers[7].get_mut().value = (cpu_state.instruction_pointer + instruction_size + 2) as u64;
                         }
-                        cpu_state.instruction_pointer = cpu_state.registers[register_index].value as usize;
+                        cpu_state.instruction_pointer = cpu_state.registers[register_index].borrow().value as usize;
                     } else {
                         cpu_state.instruction_pointer += instruction_size + 2;
                     }
                 } else {
-                    todo!("Handle exceptional situation")
+                    // conditional prefix on a conditional jump/call
+                    todo!("Illegal instruction")
                 }
             } else if instruction_data.len() < 2 {
+                // not enough bytes
                 todo!("Handle exceptional situation")
             } else {
-                todo!("Handle exceptional situation")
+                // SAF is unsupported
+                todo!("Illegal instruction")
             }
         }
         "1011_????" => {
@@ -435,23 +488,30 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
                     displacement
                 };
 
-                cpu_state.registers[7].value = (cpu_state.instruction_pointer + instruction_size + 2) as u64;
-                cpu_state.instruction_pointer = cpu_state.instruction_pointer.wrapping_add(displacement);
+                if check_condition(condition_code.unwrap_or(COND_ALWAYS), cpu_state.cr_flags) {
+                    cpu_state.registers[7].get_mut().value = (cpu_state.instruction_pointer + instruction_size + 2) as u64;
+                    cpu_state.instruction_pointer = cpu_state.instruction_pointer.wrapping_add(displacement);
+                } else {
+                    cpu_state.instruction_pointer += instruction_size + 2;
+                }
             } else if instruction_data.len() < 2 {
+                // not enough bytes
                 todo!("Handle exceptional situation")
             } else {
-                todo!("Handle exceptional situation")
+                // SAF not supported
+                todo!("Illegal instruction")
             }
         }
         "110?_????" => {
+            // multiple REX prefixes or illegal prefix
             todo!("Illegal instruction")
         }
         "1110_????" => {
-            let used_bytes = handle_exop_operations(&mut cpu_state, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex)?;
+            let used_bytes = handle_exop_operations(&mut cpu_state, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(COND_ALWAYS), rex)?;
             todo!()
         }
         "1111_????" => {
-            let used_bytes = handle_exop_jump_call(&mut cpu_state, cpu_info, &mut instruction_data, condition_code.unwrap_or(0xE))?;
+            let used_bytes = handle_exop_jump_call(&mut cpu_state, cpu_info, &mut instruction_data, condition_code.unwrap_or(COND_ALWAYS))?;
             cpu_state.instruction_pointer += instruction_size + used_bytes;
         }
     }
@@ -461,7 +521,7 @@ pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) ->
     Ok(cpu_state)
 }
 
-fn handle_base_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize, String> {
+fn handle_base_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize> {
     let first_byte = instruction_data[0];
     if first_byte & 0x40 == 0 {
         let second_byte = instruction_data[1];
@@ -475,11 +535,109 @@ fn handle_base_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: 
     }
 }
 
-fn handle_base_register_operation(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize, String> {
-    unimplemented!()
+fn handle_base_register_operation(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize> {
+    let first_byte = instruction_data[0];
+    let second_byte = instruction_data[1];
+    let operation = first_byte & 0xF;
+    let size = ValueSize::from_u8((first_byte >> 4) & 0x3);
+    let register_index_a = if rex.a {
+        ((second_byte >> 5) & 0x7) | 8
+    } else {
+        (second_byte >> 5) & 0x7
+    } as usize;
+    let register_index_b = if rex.b {
+        ((second_byte >> 2) & 0x7) | 8
+    } else {
+        (second_byte >> 2) & 0x7
+    } as usize;
+
+    let address_width = cpu_state.address_width();
+    let register_a = &cpu_state.registers[register_index_a];
+    let register_b = &cpu_state.registers[register_index_b];
+    
+    if (operation == 12 || operation == 13) && cpu_info.cpuid_1 & CP1_SAF == 0 {
+        // SAF not supported
+        todo!("Illegal instruction")
+    }
+    if operation == 14 {
+        // illegal by spec
+        todo!("Illegal instruction")
+    }
+    // operation == 15 is checked below
+    
+    if !check_condition(condition_code, cpu_state.cr_flags) {
+        if operation < 12 {
+            return Ok(2)
+        } else if operation == 12 || operation == 13 {
+            return Ok(2)
+        }
+        // operation == 14 is illegal
+        // operation == 15 is checked below
+    }
+
+    if operation < 8 {
+        let (result, flags) = perform_base_operation(operation as u64, register_a.borrow().read(cpu_info, size), register_b.borrow().read(cpu_info, size), size);
+        if let Some(result) = result {
+            register_a.borrow_mut().write(cpu_info, size, true, result)
+        }
+        cpu_state.cr_flags = flags
+    } else {
+        match operation {
+            8 => {
+                // movz
+                register_a.borrow_mut().write(cpu_info, size, false, register_b.borrow().value);
+            }
+            9 => {
+                // movs
+                register_a.borrow_mut().write(cpu_info, size, true, register_b.borrow().value);
+            }
+            10 => {
+                // load
+                let address = address_width.sign_extend(register_b.borrow().value) as usize;
+                let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0)?;
+                register_a.borrow_mut().write(cpu_info, size, true, data);
+            }
+            11 => {
+                // store
+                let value = register_a.borrow().read(cpu_info, size);
+                let address = address_width.sign_extend(register_b.borrow().value) as usize;
+                memory.write(address, size, value, cpu_info.feat & FT_UMA != 0)?;
+            }
+            12 => {
+                // pop
+                let stack_pointer = register_b.borrow().value.wrapping_sub(address_width.num_bytes() as u64);
+                let address = address_width.sign_extend(stack_pointer) as usize;
+                memory.write(address, size, register_b.borrow().value, cpu_info.feat & FT_UMA != 0)?;
+                register_b.borrow_mut().write(cpu_info, address_width, false, address as u64);
+            }
+            13 => {
+                // push
+                let stack_pointer = register_a.borrow().value.wrapping_sub(address_width.num_bytes() as u64);
+                let address = address_width.sign_extend(stack_pointer) as usize;
+                memory.write(address, size, register_b.borrow().value, cpu_info.feat & FT_UMA != 0)?;
+                register_a.borrow_mut().write(cpu_info, address_width, false, address as u64);
+            }
+            14 => {
+                // Illegal instruction
+                // handled above
+                unreachable!()
+            }
+            15 => {
+                if register_index_b > 1 || cpu_info.cpuid_1 & CP1_CI == 0 {
+                    todo!("Illegal instruction")
+                }
+                
+                // condition is ignored since cache instructions are NOP on a system without a cache
+                return Ok(2)
+            }
+            _ => unreachable!()
+        }
+    }
+
+    Ok(2)
 }
 
-fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize, String> {
+fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize> {
     let first_byte = instruction_data[0];
     let second_byte = instruction_data[1];
     let operation = first_byte & 0xF;
@@ -496,7 +654,8 @@ fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUI
         (second_byte >> 5) & 0x7
     } as usize;
 
-    let register = &mut cpu_state.registers[register_index];
+    let address_width = cpu_state.address_width();
+    let register = &mut cpu_state.registers[register_index].get_mut();
 
     if operation < 8 {
         let (result, flags) = perform_base_operation(operation as u64, register.read(cpu_info, size), immediate, size);
@@ -516,36 +675,15 @@ fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUI
             }
             10 => {
                 // load
-                let address = cpu_state.address_width().sign_extend(immediate) as usize;
-                let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0);
-                // need to drop the mutable reference to grab the address width from cpu_state
-                let register = &mut cpu_state.registers[register_index];
-                match data {
-                    Ok(data) => {
-                        register.write(cpu_info, size, true, data);
-                    }
-                    Err(MemoryError::Unaligned) => {
-                        return Err("Attempted to read from an unaligned memory address".to_string())
-                    }
-                    Err(MemoryError::NotMapped) => {
-                        return Err("Attempted to read from unmapped memory".to_string())
-                    }
-                }
+                let address = address_width.sign_extend(immediate) as usize;
+                let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0)?;
+                register.write(cpu_info, size, true, data);
             }
             11 => {
                 // store
                 let value = register.read(cpu_info, size);
-                let address = cpu_state.address_width().sign_extend(immediate) as usize;
-                let result = memory.write(address, size, value, cpu_info.feat & FT_UMA != 0);
-                match result {
-                    Ok(()) => {}
-                    Err(MemoryError::Unaligned) => {
-                        return Err("Attempted to write to an unaligned memory address".to_string())
-                    }
-                    Err(MemoryError::NotMapped) => {
-                        return Err("Attempted to write to an unmapped memory address".to_string())
-                    }
-                }
+                let address = address_width.sign_extend(immediate) as usize;
+                memory.write(address, size, value, cpu_info.feat & FT_UMA != 0)?;
             }
             12 => {
                 // slo
@@ -553,7 +691,11 @@ fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUI
                 register.write(cpu_info, size, true, new_value);
             }
             13 => {
-                todo!()
+                // push
+                let value = register.value.wrapping_sub(address_width.num_bytes() as u64);
+                let address = address_width.sign_extend(value) as usize;
+                memory.write(address, size, immediate, cpu_info.feat & FT_UMA != 0)?;
+                register.write(cpu_info, address_width, false, address as u64);
             }
             14 => {
                 // readcr
@@ -562,7 +704,7 @@ fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUI
                 if let Some(data) = data {
                     // needed to drop the old reference before calling read_cr
                     let register = &mut cpu_state.registers[register_index];
-                    register.write(cpu_info, size, true, data);
+                    register.get_mut().write(cpu_info, size, true, data);
                 }
             }
             15 => {
@@ -577,7 +719,7 @@ fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUI
     Ok(2)
 }
 
-fn handle_base_mem_operation(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize, String> {
+fn handle_base_mem_operation(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize> {
     todo!()
 }
 
@@ -824,14 +966,14 @@ fn write_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize, data: u6
         14 => {}
         15 => {
             if cpu_state.cr_priv == 1 {
-                cpu_state.cr_no_cache_start = (data as usize) & !(CACHE_LINE_SIZE - 1)
+                cpu_state.cr_no_cache_start = (data as usize) & !CACHE_LINE_SIZE.wrapping_sub(1)
             } else {
                 todo!("Handle exceptional state")
             }
         }
         16 => {
             if cpu_state.cr_priv == 1 {
-                cpu_state.cr_no_cache_end = (data as usize) & !(CACHE_LINE_SIZE - 1)
+                cpu_state.cr_no_cache_end = (data as usize) & !CACHE_LINE_SIZE.wrapping_sub(1)
             } else {
                 todo!("Handle exceptional state")
             }
@@ -847,11 +989,11 @@ fn write_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize, data: u6
     }
 }
 
-fn handle_exop_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize, String> {
+fn handle_exop_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize> {
     unimplemented!()
 }
 
-fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, instruction_data: &mut VecDeque<u8>, condition_code: u8) -> Result<usize, String> {
+fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, instruction_data: &mut VecDeque<u8>, condition_code: u8) -> Result<usize> {
     let address_width = cpu_state.address_width();
     let first_byte = instruction_data[0];
     let call = first_byte & 8 != 0;
@@ -896,7 +1038,7 @@ fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, instructi
 
     if check_condition(condition_code, cpu_state.cr_flags) {
         if call {
-            cpu_state.registers[7].write(cpu_info, address_width, true, cpu_state.instruction_pointer as u64)
+            cpu_state.registers[7].get_mut().write(cpu_info, address_width, true, cpu_state.instruction_pointer as u64)
         }
 
         cpu_state.instruction_pointer = if absolute {

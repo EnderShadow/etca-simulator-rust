@@ -1,11 +1,45 @@
+mod tests;
+
 use std::cell::RefCell;
 use std::cmp::min;
-use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 use range_ext::intersect::{Intersect, Intersection};
+use thiserror::Error;
 use crate::cpu::{MAX_INSTRUCTION_SIZE, ValueSize};
+use crate::mem::MemoryError::{MMIOConfiguration, OverlappingMMIOSegment};
+
+type Result<T> = std::result::Result<T, MemoryError>;
+
+#[derive(Error, Debug)]
+pub enum MemoryError {
+    #[error("Unmapped memory address {0}.")]
+    UnmappedMemory(usize),
+    #[error("Unaligned access of {num_bytes} bytes at address {address}.")]
+    UnalignedAccess {
+        address: usize,
+        num_bytes: u8
+    },
+    #[error("Cannot add segment from address {start_address} to {end_address} because it would overlap with another memory segment.")]
+    OverlappingMemorySegment {
+        start_address: usize,
+        end_address: usize
+    },
+    #[error("Unable to configure the MMIO device with the requested address of {requested_address} or size {requested_size}. Device start and size for device {device_identifier} are {actual_address} and {actual_size}")]
+    MMIOConfiguration {
+        device_identifier: String,
+        requested_address: usize,
+        requested_size: usize,
+        actual_address: usize,
+        actual_size: usize
+    },
+    #[error("Cannot add MMIO from address {start_address} to {end_address} because it would overlap with another MMIO device.")]
+    OverlappingMMIOSegment {
+        start_address: usize,
+        end_address: usize
+    }
+}
 
 enum MemoryMapType {
     Ram(Rc<RefCell<Box<[u8]>>>),
@@ -143,35 +177,52 @@ impl MemoryMapSegment {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum MemoryError {
-    NotMapped,
-    Unaligned
+#[derive(Debug, Eq, PartialEq, Copy, Clone)]
+pub struct MMIOConfig {
+    address: usize,
+    size: usize
+}
+
+pub trait MMIODevice {
+    fn identifier(&self) -> &str;
+    fn configure(&mut self, new_configuration: MMIOConfig) -> MMIOConfig;
+    fn get_configuration(&self) -> MMIOConfig;
+    fn read(&mut self, address: usize) -> usize;
+    fn read_bytes(&mut self, address: usize, num_bytes: usize, buffer: &mut Vec<u8>);
+    fn write(&mut self, address: usize, data: u64);
+    fn write_bytes(&mut self, address: usize, num_bytes: usize, data: &[u8]);
 }
 
 pub struct Memory {
-    memory_segments: Vec<MemoryMapSegment>
+    memory_segments: Vec<MemoryMapSegment>,
+    mmio_devices: Vec<Box<dyn MMIODevice>>
 }
 
 impl Memory {
     pub fn new() -> Memory {
         Memory {
-            memory_segments: Vec::new()
+            memory_segments: Vec::new(),
+            mmio_devices: Vec::new()
         }
     }
 
     pub fn dump_memory_map(&self) -> Vec<String> {
         let mut mapping = Vec::new();
 
-        let mut sorted_segments = self.memory_segments.iter().map(|ms| {
+        let mut sorted_memory_segments = self.memory_segments.iter().map(|ms| {
             let mem_type = match ms.mm_type {
                 MemoryMapType::Rom(_) => "ROM",
                 _ => "RAM"
             };
             (ms.start, ms.start + (ms.size - 1), mem_type)
         }).collect::<Vec<_>>();
-        sorted_segments.sort_by_key(|x| x.0);
-        for (start, end, mem_type) in sorted_segments {
+        let sorted_mmio_segments = self.mmio_devices.iter().map(|md| {
+            let config = md.get_configuration();
+            (config.address, config.address + (config.size - 1), md.identifier())
+        }).collect::<Vec<_>>();
+        sorted_memory_segments.extend(sorted_mmio_segments);
+        sorted_memory_segments.sort_by_key(|x| x.0);
+        for (start, end, mem_type) in sorted_memory_segments {
             let text = format!("{start:#018X} - {end:#018X}\t{mem_type}");
             mapping.push(text);
         }
@@ -179,7 +230,7 @@ impl Memory {
         mapping
     }
 
-    pub fn add_ram(&mut self, start: usize, size: NonZeroUsize) -> Result<(), String> {
+    pub fn add_ram(&mut self, start: usize, size: NonZeroUsize) -> Result<()> {
         let size = size.into();
         // require 8 byte aligned segments
         assert_eq!(start & 0x7, 0);
@@ -190,7 +241,10 @@ impl Memory {
             let mem_range = x.start..=(x.start + (x.size - 1));
             mem_range.intersect(&range) != Intersection::Empty
         }) {
-            return Err(format!("Cannot add ram from address {start} to {} because it would overlap with another memory segment.", start + size))
+            return Err(MemoryError::OverlappingMemorySegment {
+                start_address: start,
+                end_address: start + size
+            })
         }
 
         let memory = vec![0u8; size].into_boxed_slice();
@@ -205,7 +259,7 @@ impl Memory {
         Ok(())
     }
 
-    pub fn add_rom(&mut self, start: usize, size: NonZeroUsize, data: &[u8]) -> Result<(), String> {
+    pub fn add_rom(&mut self, start: usize, size: NonZeroUsize, data: &[u8]) -> Result<()> {
         let size = size.into();
         // require 8 byte aligned segments
         assert_eq!(start & 0x7, 0);
@@ -216,7 +270,10 @@ impl Memory {
             let mem_range = x.start..=(x.start + (x.size - 1));
             mem_range.intersect(&range) != Intersection::Empty
         }) {
-            return Err(format!("Cannot add rom from address {start} to {} because it would overlap with another memory segment.", start + size))
+            return Err(MemoryError::OverlappingMemorySegment {
+                start_address: start,
+                end_address: start + size
+            })
         }
 
         let fill_length = min(data.len(), size);
@@ -235,7 +292,7 @@ impl Memory {
         Ok(())
     }
 
-    pub fn add_tiled_ram(&mut self, start: usize, size: NonZeroUsize, tile_size: usize) -> Result<(), String> {
+    pub fn add_tiled_ram(&mut self, start: usize, size: NonZeroUsize, tile_size: usize) -> Result<()> {
         let size = size.into();
         // require 8 byte aligned segments
         assert_eq!(start & 0x7, 0);
@@ -247,7 +304,10 @@ impl Memory {
             let mem_range = x.start..=(x.start + (x.size - 1));
             mem_range.intersect(&range) != Intersection::Empty
         }) {
-            return Err(format!("Cannot add tiled ram from address {start} to {} because it would overlap with another memory segment.", start + size))
+            return Err(MemoryError::OverlappingMemorySegment {
+                start_address: start,
+                end_address: start + size
+            })
         }
 
         let memory = vec![0u8; tile_size].into_boxed_slice();
@@ -262,13 +322,49 @@ impl Memory {
         Ok(())
     }
 
-    pub fn read(&self, address: usize, size: ValueSize, allow_unaligned: bool) -> Result<u64, MemoryError> {
+    pub fn add_mmio(&mut self, start: usize, size: NonZeroUsize, mut mmio_device: Box<dyn MMIODevice>) -> Result<()> {
+        let size: usize = size.into();
+
+        let desired_config = MMIOConfig {
+            address: start,
+            size
+        };
+        let new_config = mmio_device.configure(desired_config);
+        if desired_config != new_config {
+            return Err(MMIOConfiguration {
+                device_identifier: mmio_device.identifier().into(),
+                requested_address: start,
+                requested_size: size,
+                actual_address: new_config.address,
+                actual_size: new_config.size
+            })
+        }
+
+        let range = start..=(start + (size - 1));
+
+        if self.mmio_devices.iter().any(|x| {
+            let md_config = x.get_configuration();
+            let md_range = md_config.address..=(md_config.address + (md_config.size - 1));
+            md_range.intersect(&range) != Intersection::Empty
+        }) {
+            return Err(OverlappingMMIOSegment {
+                start_address: start,
+                end_address: start + size
+            })
+        }
+
+        self.mmio_devices.push(mmio_device);
+        Ok(())
+    }
+
+    pub fn read(&self, address: usize, size: ValueSize, allow_unaligned: bool) -> Result<u64> {
+        // TODO check mmio before memory
         if size.is_aligned(address) {
             let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
             if let Some(segment) = segment {
                 Ok(segment.read_aligned(address, size))
             } else {
-                Err(MemoryError::NotMapped)
+                Err(MemoryError::UnmappedMemory(address))
             }
         } else if allow_unaligned {
             let num_bytes_to_read = size.num_bytes();
@@ -281,7 +377,7 @@ impl Memory {
                     let num_read = segment.read_bytes(address, &mut buffer, num_bytes_to_read - buffer_length);
                     address += num_read;
                 } else {
-                    return Err(MemoryError::NotMapped)
+                    return Err(MemoryError::UnmappedMemory(address))
                 }
             }
 
@@ -294,18 +390,22 @@ impl Memory {
 
             Ok(result)
         } else {
-            Err(MemoryError::Unaligned)
+            Err(MemoryError::UnalignedAccess {
+                address,
+                num_bytes: size.num_bytes() as u8
+            })
         }
     }
 
-    pub fn write(&mut self, address: usize, size: ValueSize, value: u64, allow_unaligned: bool) -> Result<(), MemoryError> {
+    pub fn write(&mut self, address: usize, size: ValueSize, value: u64, allow_unaligned: bool) -> Result<()> {
+        // TODO check mmio before memory
         if size.is_aligned(address) {
             let segment = self.memory_segments.iter_mut().find(|x| x.start <= address && address - x.start < x.size);
             if let Some(segment) = segment {
                 segment.write_aligned(address, size, value);
                 Ok(())
             } else {
-                Err(MemoryError::NotMapped)
+                Err(MemoryError::UnmappedMemory(address))
             }
         } else if allow_unaligned {
             let mut data = match size {
@@ -323,17 +423,21 @@ impl Memory {
                     address += num_written;
                     data = Box::from(&data[num_written..])
                 } else {
-                    return Err(MemoryError::NotMapped)
+                    return Err(MemoryError::UnmappedMemory(address))
                 }
             }
 
             Ok(())
         } else {
-            Err(MemoryError::Unaligned)
+            Err(MemoryError::UnalignedAccess {
+                address,
+                num_bytes: size.num_bytes() as u8
+            })
         }
     }
 
-    pub fn read_instruction_data(&self, mut address: usize) -> Result<VecDeque<u8>, MemoryError> {
+    pub fn read_instruction_data(&self, mut address: usize) -> Vec<u8> {
+        // TODO check mmio before memory
         let num_bytes_to_read = MAX_INSTRUCTION_SIZE;
         let mut buffer = Vec::with_capacity(num_bytes_to_read);
         while buffer.len() < num_bytes_to_read {
@@ -348,6 +452,6 @@ impl Memory {
             }
         }
 
-        Ok(VecDeque::from(buffer))
+        buffer
     }
 }

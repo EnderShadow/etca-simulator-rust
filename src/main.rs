@@ -1,6 +1,5 @@
-mod cpu;
-mod tests;
 mod mem;
+mod cpu;
 
 use std::num::NonZeroUsize;
 use cpu::*;

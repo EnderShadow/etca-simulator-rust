@@ -1,66 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use std::io::repeat;
     use std::num::NonZeroUsize;
-    use crate::cpu::{ALL_CP1, ALL_CP2, ALL_FT, CP1_BYTE, CP1_INT, CP1_QW, CPUInfo, Register, ValueSize};
-    use crate::mem::Memory;
-
-    #[test]
-    fn cpu_info_no_extensions() {
-        let cpu_info = CPUInfo::new(0, 0, 0, false);
-        assert!(cpu_info.is_ok())
-    }
-
-    #[test]
-    fn cpu_info_all_defined_extensions() {
-        let cpu_info = CPUInfo::new(ALL_CP1, ALL_CP2, ALL_FT, false);
-        assert!(cpu_info.is_ok())
-    }
-
-    #[test]
-    fn cpu_info_missing_extensions() {
-        let cpu_info = CPUInfo::new(CP1_INT, 0, 0, false);
-        assert!(cpu_info.is_err())
-    }
-
-    #[test]
-    fn cpu_info_all_extensions() {
-        let cpu_info = CPUInfo::new(u64::MAX, u64::MAX, u64::MAX, false);
-        assert!(cpu_info.is_err())
-    }
-
-    #[test]
-    fn register_sign_extension() {
-        let cpu_info = CPUInfo::new(CP1_BYTE | CP1_QW, 0, 0, false).unwrap();
-        let mut register = Register::default();
-
-        register.write(&cpu_info, ValueSize::HALF, true, 255);
-        assert_eq!(register.read(&cpu_info, ValueSize::QUAD), u64::MAX)
-    }
-
-    #[test]
-    fn register_zero_extension() {
-        let cpu_info = CPUInfo::new(CP1_BYTE | CP1_QW, 0, 0, false).unwrap();
-        let mut register = Register::default();
-
-        register.write(&cpu_info, ValueSize::HALF, false, 255);
-        assert_eq!(register.read(&cpu_info, ValueSize::QUAD), 255)
-    }
-
-    #[test]
-    #[should_panic]
-    fn register_unimplemented_size() {
-        let cpu_info = CPUInfo::new(CP1_BYTE, 0, 0, false).unwrap();
-        let mut register = Register::default();
-
-        register.write(&cpu_info, ValueSize::DOUBLE, false, 255);
-    }
-
-    #[test]
-    fn inverse_mask_test() {
-        assert_eq!(ValueSize::HALF.inverse_mask(), 0xFFFF_FFFF_FFFF_FF00u64);
-    }
-
+    use crate::cpu::ValueSize;
+    use crate::mem::{Memory, MMIOConfig, MMIODevice};
+    
     #[test]
     fn non_overlapping_memory() {
         let mut memory = Memory::new();
@@ -154,5 +97,87 @@ mod tests {
         let value = memory.read(254, ValueSize::DOUBLE, true).unwrap();
 
         assert_eq!(value, 0x12345678)
+    }
+
+    struct TestMMIODevice {
+        config: MMIOConfig
+    }
+    
+    impl TestMMIODevice {
+        fn new() -> Self {
+            TestMMIODevice {
+                config: MMIOConfig {
+                    address: 0,
+                    size: 32
+                }
+            }
+        }
+    }
+
+    impl MMIODevice for TestMMIODevice {
+        fn identifier(&self) -> &str {
+            "Test Device"
+        }
+
+        fn configure(&mut self, new_configuration: MMIOConfig) -> MMIOConfig {
+            if new_configuration.size < 512 {
+                self.config = new_configuration;
+            }
+            self.config
+        }
+
+        fn get_configuration(&self) -> MMIOConfig {
+            self.config
+        }
+
+        fn read(&mut self, address: usize) -> usize {
+            0
+        }
+
+        fn read_bytes(&mut self, address: usize, num_bytes: usize, buffer: &mut Vec<u8>) {
+            
+        }
+
+        fn write(&mut self, address: usize, data: u64) {
+            
+        }
+
+        fn write_bytes(&mut self, address: usize, num_bytes: usize, data: &[u8]) {
+            
+        }
+    }
+
+    #[test]
+    fn configure_mmio_success() {
+        let mut memory = Memory::new();
+        let test_device = Box::from(TestMMIODevice::new());
+        let result = memory.add_mmio(0, NonZeroUsize::new(64).unwrap(), test_device);
+        result.unwrap();
+    }
+
+    #[test]
+    fn configure_mmio_fail() {
+        let mut memory = Memory::new();
+        let test_device = Box::from(TestMMIODevice::new());
+        let result = memory.add_mmio(0, NonZeroUsize::new(1024).unwrap(), test_device);
+        result.unwrap_err();
+    }
+
+    #[test]
+    fn non_overlapping_mmio() {
+        let mut memory = Memory::new();
+        let test_device = Box::from(TestMMIODevice::new());
+        memory.add_mmio(0, NonZeroUsize::new(64).unwrap(), test_device).unwrap();
+        let test_device2 = Box::from(TestMMIODevice::new());
+        memory.add_mmio(64, NonZeroUsize::new(128).unwrap(), test_device2).unwrap();
+    }
+
+    #[test]
+    fn overlapping_mmio() {
+        let mut memory = Memory::new();
+        let test_device = Box::from(TestMMIODevice::new());
+        memory.add_mmio(0, NonZeroUsize::new(64).unwrap(), test_device).unwrap();
+        let test_device2 = Box::from(TestMMIODevice::new());
+        memory.add_mmio(32, NonZeroUsize::new(128).unwrap(), test_device2).unwrap_err();
     }
 }
