@@ -1,36 +1,36 @@
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
-    use crate::cpu::{ALL_CP1, ALL_CP2, ALL_FT, CP1_BYTE, CP1_INT, CP1_QW, CPUInfo, CPUState, Register, tick, ValueSize};
+    use crate::cpu::{ALL_CP1, ALL_CP2, ALL_FT, CP1_BYTE, CP1_INT, CP1_QW, CPUInfo, CPUState, Register, tick, UndefinedBehaviorMode, ValueSize};
     use crate::mem::Memory;
 
     #[test]
     fn cpu_info_no_extensions() {
-        let cpu_info = CPUInfo::new(0, 0, 0, false);
+        let cpu_info = CPUInfo::new(0, 0, 0, false, UndefinedBehaviorMode::Relaxed);
         assert!(cpu_info.is_ok())
     }
 
     #[test]
     fn cpu_info_all_defined_extensions() {
-        let cpu_info = CPUInfo::new(ALL_CP1, ALL_CP2, ALL_FT, false);
+        let cpu_info = CPUInfo::new(ALL_CP1, ALL_CP2, ALL_FT, false, UndefinedBehaviorMode::Relaxed);
         assert!(cpu_info.is_ok())
     }
 
     #[test]
     fn cpu_info_missing_extensions() {
-        let cpu_info = CPUInfo::new(CP1_INT, 0, 0, false);
+        let cpu_info = CPUInfo::new(CP1_INT, 0, 0, false, UndefinedBehaviorMode::Relaxed);
         assert!(cpu_info.is_err())
     }
 
     #[test]
     fn cpu_info_all_extensions() {
-        let cpu_info = CPUInfo::new(u64::MAX, u64::MAX, u64::MAX, false);
+        let cpu_info = CPUInfo::new(u64::MAX, u64::MAX, u64::MAX, false, UndefinedBehaviorMode::Relaxed);
         assert!(cpu_info.is_err())
     }
 
     #[test]
     fn register_sign_extension() {
-        let cpu_info = CPUInfo::new(CP1_BYTE | CP1_QW, 0, 0, false).unwrap();
+        let cpu_info = CPUInfo::new(CP1_BYTE | CP1_QW, 0, 0, false, UndefinedBehaviorMode::Relaxed).unwrap();
         let mut register = Register::default();
 
         register.write(&cpu_info, ValueSize::HALF, true, 255);
@@ -39,7 +39,7 @@ mod tests {
 
     #[test]
     fn register_zero_extension() {
-        let cpu_info = CPUInfo::new(CP1_BYTE | CP1_QW, 0, 0, false).unwrap();
+        let cpu_info = CPUInfo::new(CP1_BYTE | CP1_QW, 0, 0, false, UndefinedBehaviorMode::Relaxed).unwrap();
         let mut register = Register::default();
 
         register.write(&cpu_info, ValueSize::HALF, false, 255);
@@ -49,7 +49,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn register_unimplemented_size() {
-        let cpu_info = CPUInfo::new(CP1_BYTE, 0, 0, false).unwrap();
+        let cpu_info = CPUInfo::new(CP1_BYTE, 0, 0, false, UndefinedBehaviorMode::Relaxed).unwrap();
         let mut register = Register::default();
 
         register.write(&cpu_info, ValueSize::DOUBLE, false, 255);
@@ -73,7 +73,7 @@ mod tests {
     fn basic_addition_test() {
         let rom_data: [u8; 6] = [0x58, 0x0F, 0x58, 0x23, 0x10, 0x04];
         let mut memory = basic_16bit_memory(rom_data.as_slice());
-        let cpu_info = CPUInfo::new(0, 0, 0, false).unwrap();
+        let cpu_info = CPUInfo::new(0, 0, 0, false, UndefinedBehaviorMode::Relaxed).unwrap();
         let mut cpu_state = CPUState::new();
 
         for _ in 0..3 {
@@ -95,7 +95,7 @@ mod tests {
     fn basic_addition_test2() {
         let rom_data: [u8; 4] = [0x58, 0x0F, 0x10, 0x00];
         let mut memory = basic_16bit_memory(rom_data.as_slice());
-        let cpu_info = CPUInfo::new(0, 0, 0, false).unwrap();
+        let cpu_info = CPUInfo::new(0, 0, 0, false, UndefinedBehaviorMode::Relaxed).unwrap();
         let mut cpu_state = CPUState::new();
 
         for _ in 0..2 {

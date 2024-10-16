@@ -6,7 +6,7 @@ use cpu::*;
 use crate::mem::Memory;
 
 fn main() {
-    let cpu_info = CPUInfo::new(ALL_CP1, ALL_CP2, ALL_FT, false).unwrap();
+    let cpu_info = CPUInfo::new(ALL_CP1, ALL_CP2, ALL_FT, false, UndefinedBehaviorMode::Relaxed).unwrap();
     let cpu_state = CPUState::new();
     let mut memory = Memory::new();
     let mem_seg_size = NonZeroUsize::new(1 << 15).unwrap();
