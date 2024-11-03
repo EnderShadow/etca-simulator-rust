@@ -187,10 +187,10 @@ pub trait MMIODevice {
     fn identifier(&self) -> &str;
     fn configure(&mut self, new_configuration: MMIOConfig) -> MMIOConfig;
     fn get_configuration(&self) -> MMIOConfig;
-    fn read(&mut self, address: usize) -> usize;
-    fn read_bytes(&mut self, address: usize, num_bytes: usize, buffer: &mut Vec<u8>);
+    fn read(&mut self, address: usize) -> u64;
+    fn read_bytes(&mut self, address: usize, buffer: &mut Vec<u8>, num_bytes: usize) -> usize;
     fn write(&mut self, address: usize, data: u64);
-    fn write_bytes(&mut self, address: usize, num_bytes: usize, data: &[u8]);
+    fn write_bytes(&mut self, address: usize, data: &[u8], num_bytes: usize) -> usize;
 }
 
 pub struct Memory {
@@ -357,27 +357,44 @@ impl Memory {
         Ok(())
     }
 
-    pub fn read(&self, address: usize, size: ValueSize, allow_unaligned: bool) -> Result<u64> {
-        // TODO check mmio before memory
+    pub fn read(&mut self, address: usize, size: ValueSize, allow_unaligned: bool) -> Result<u64> {
         if size.is_aligned(address) {
-            let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
-            if let Some(segment) = segment {
-                Ok(segment.read_aligned(address, size))
+            let device = self.mmio_devices.iter_mut().find(|x| {
+                let config = x.get_configuration();
+                config.address <= address && address - config.address < config.size
+            });
+            if let Some(device) = device {
+                Ok(device.read(address))
             } else {
-                Err(MemoryError::UnmappedMemory(address))
+                let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
+                if let Some(segment) = segment {
+                    Ok(segment.read_aligned(address, size))
+                } else {
+                    Err(MemoryError::UnmappedMemory(address))
+                }
             }
         } else if allow_unaligned {
             let num_bytes_to_read = size.num_bytes();
             let mut buffer = Vec::with_capacity(num_bytes_to_read);
             let mut address = address;
             while buffer.len() < num_bytes_to_read {
-                let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
-                if let Some(segment) = segment {
+                let device = self.mmio_devices.iter_mut().find(|x| {
+                    let config = x.get_configuration();
+                    config.address <= address && address - config.address < config.size
+                });
+                if let Some(device) = device {
                     let buffer_length = buffer.len();
-                    let num_read = segment.read_bytes(address, &mut buffer, num_bytes_to_read - buffer_length);
+                    let num_read = device.read_bytes(address, &mut buffer, num_bytes_to_read - buffer_length);
                     address += num_read;
                 } else {
-                    return Err(MemoryError::UnmappedMemory(address))
+                    let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
+                    if let Some(segment) = segment {
+                        let buffer_length = buffer.len();
+                        let num_read = segment.read_bytes(address, &mut buffer, num_bytes_to_read - buffer_length);
+                        address += num_read;
+                    } else {
+                        return Err(MemoryError::UnmappedMemory(address))
+                    }
                 }
             }
 
@@ -398,14 +415,22 @@ impl Memory {
     }
 
     pub fn write(&mut self, address: usize, size: ValueSize, value: u64, allow_unaligned: bool) -> Result<()> {
-        // TODO check mmio before memory
         if size.is_aligned(address) {
-            let segment = self.memory_segments.iter_mut().find(|x| x.start <= address && address - x.start < x.size);
-            if let Some(segment) = segment {
-                segment.write_aligned(address, size, value);
+            let device = self.mmio_devices.iter_mut().find(|x| {
+                let config = x.get_configuration();
+                config.address <= address && address - config.address < config.size
+            });
+            if let Some(device) = device {
+                device.write(address, value);
                 Ok(())
             } else {
-                Err(MemoryError::UnmappedMemory(address))
+                let segment = self.memory_segments.iter_mut().find(|x| x.start <= address && address - x.start < x.size);
+                if let Some(segment) = segment {
+                    segment.write_aligned(address, size, value);
+                    Ok(())
+                } else {
+                    Err(MemoryError::UnmappedMemory(address))
+                }
             }
         } else if allow_unaligned {
             let mut data = match size {
@@ -417,13 +442,23 @@ impl Memory {
 
             let mut address = address;
             while data.len() > 0 {
-                let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
-                if let Some(segment) = segment {
-                    let num_written = segment.write_bytes(address, &data, data.len());
+                let device = self.mmio_devices.iter_mut().find(|x| {
+                    let config = x.get_configuration();
+                    config.address <= address && address - config.address < config.size
+                });
+                if let Some(device) = device {
+                    let num_written = device.write_bytes(address, &data, data.len());
                     address += num_written;
                     data = Box::from(&data[num_written..])
                 } else {
-                    return Err(MemoryError::UnmappedMemory(address))
+                    let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
+                    if let Some(segment) = segment {
+                        let num_written = segment.write_bytes(address, &data, data.len());
+                        address += num_written;
+                        data = Box::from(&data[num_written..])
+                    } else {
+                        return Err(MemoryError::UnmappedMemory(address))
+                    }
                 }
             }
 
@@ -436,19 +471,28 @@ impl Memory {
         }
     }
 
-    pub fn read_instruction_data(&self, mut address: usize) -> Vec<u8> {
-        // TODO check mmio before memory
+    pub fn read_instruction_data(&mut self, mut address: usize) -> Vec<u8> {
         let num_bytes_to_read = MAX_INSTRUCTION_SIZE;
         let mut buffer = Vec::with_capacity(num_bytes_to_read);
         while buffer.len() < num_bytes_to_read {
-            let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
-            if let Some(segment) = segment {
+            let device = self.mmio_devices.iter_mut().find(|x| {
+                let config = x.get_configuration();
+                config.address <= address && address - config.address < config.size
+            });
+            if let Some(device) = device {
                 let buffer_length = buffer.len();
-                let num_read = segment.read_bytes(address, &mut buffer, num_bytes_to_read - buffer_length);
+                let num_read = device.read_bytes(address, &mut buffer, num_bytes_to_read - buffer_length);
                 address += num_read;
             } else {
-                // if we encounter an unmapped memory segment, we should stop reading since it might not be a problem
-                break
+                let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
+                if let Some(segment) = segment {
+                    let buffer_length = buffer.len();
+                    let num_read = segment.read_bytes(address, &mut buffer, num_bytes_to_read - buffer_length);
+                    address += num_read;
+                } else {
+                    // if we encounter an unmapped memory segment, we should stop reading since it might not be a problem
+                    break
+                }
             }
         }
 

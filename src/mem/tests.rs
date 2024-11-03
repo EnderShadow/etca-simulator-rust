@@ -1,3 +1,4 @@
+use std::cmp::min;
 #[cfg(test)]
 use std::num::NonZeroUsize;
 #[cfg(test)]
@@ -134,20 +135,26 @@ impl MMIODevice for TestMMIODevice {
         self.config
     }
 
-    fn read(&mut self, address: usize) -> usize {
+    fn read(&mut self, address: usize) -> u64 {
         0
     }
 
-    fn read_bytes(&mut self, address: usize, num_bytes: usize, buffer: &mut Vec<u8>) {
-
+    fn read_bytes(&mut self, address: usize, buffer: &mut Vec<u8>, num_bytes: usize) -> usize {
+        let config = self.config;
+        let available_bytes = config.address - address + config.size;
+        let amt = min(num_bytes, available_bytes);
+        buffer.extend(vec![0; amt]);
+        amt
     }
 
     fn write(&mut self, address: usize, data: u64) {
 
     }
 
-    fn write_bytes(&mut self, address: usize, num_bytes: usize, data: &[u8]) {
-
+    fn write_bytes(&mut self, address: usize, data: &[u8], num_bytes: usize) -> usize {
+        let config = self.config;
+        let available_capacity = config.address - address + config.size;
+        min(num_bytes, available_capacity)
     }
 }
 
