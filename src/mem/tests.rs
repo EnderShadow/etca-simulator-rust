@@ -1,7 +1,8 @@
 #[cfg(test)]
-
 use std::num::NonZeroUsize;
+#[cfg(test)]
 use crate::cpu::ValueSize;
+#[cfg(test)]
 use crate::mem::{Memory, MMIOConfig, MMIODevice};
 
 #[test]
@@ -99,10 +100,12 @@ fn multi_segment_memory_read() {
     assert_eq!(value, 0x12345678)
 }
 
+#[cfg(test)]
 struct TestMMIODevice {
     config: MMIOConfig
 }
 
+#[cfg(test)]
 impl TestMMIODevice {
     fn new() -> Self {
         TestMMIODevice {
@@ -114,6 +117,7 @@ impl TestMMIODevice {
     }
 }
 
+#[cfg(test)]
 impl MMIODevice for TestMMIODevice {
     fn identifier(&self) -> &str {
         "Test Device"

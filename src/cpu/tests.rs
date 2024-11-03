@@ -1,7 +1,8 @@
 #[cfg(test)]
-
 use std::num::NonZeroUsize;
+#[cfg(test)]
 use crate::cpu::{ALL_CP1, ALL_CP2, ALL_FT, CP1_BYTE, CP1_INT, CP1_QW, CPUInfo, CPUState, Register, UndefinedBehaviorMode, ValueSize};
+#[cfg(test)]
 use crate::mem::Memory;
 
 #[test]
