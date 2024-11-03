@@ -64,10 +64,10 @@ impl MemoryMapSegment {
         };
         match &self.mm_type {
             MemoryMapType::Ram(data) => {
-                read_from_bytes(&**data.borrow())
+                read_from_bytes(&data.borrow())
             }
             MemoryMapType::Rom(data) => {
-                read_from_bytes(&**data.borrow())
+                read_from_bytes(&data.borrow())
             }
             MemoryMapType::TileRam(data) => {
                 let mut temp_buffer: Vec<u8> = Vec::with_capacity(8);
@@ -216,11 +216,11 @@ impl Memory {
             };
             (ms.start, ms.start + (ms.size - 1), mem_type)
         }).collect::<Vec<_>>();
-        let sorted_mmio_segments = self.mmio_devices.iter().map(|md| {
+        let mmio_segments = self.mmio_devices.iter().map(|md| {
             let config = md.get_configuration();
             (config.address, config.address + (config.size - 1), md.identifier())
         }).collect::<Vec<_>>();
-        sorted_memory_segments.extend(sorted_mmio_segments);
+        sorted_memory_segments.extend(mmio_segments);
         sorted_memory_segments.sort_by_key(|x| x.0);
         for (start, end, mem_type) in sorted_memory_segments {
             let text = format!("{start:#018X} - {end:#018X}\t{mem_type}");
@@ -419,7 +419,7 @@ impl Memory {
             while data.len() > 0 {
                 let segment = self.memory_segments.iter().find(|x| x.start <= address && address - x.start < x.size);
                 if let Some(segment) = segment {
-                    let num_written = segment.write_bytes(address, &*data, data.len());
+                    let num_written = segment.write_bytes(address, &data, data.len());
                     address += num_written;
                     data = Box::from(&data[num_written..])
                 } else {
