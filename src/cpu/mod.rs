@@ -527,7 +527,7 @@ impl CPUState {
             }
             "1110_????" => {
                 let used_bytes = handle_exop_operations(&mut self, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(COND_ALWAYS), rex)?;
-                todo!()
+                self.instruction_pointer += instruction_size + used_bytes;
             }
             "1111_????" => {
                 let used_bytes = handle_exop_jump_call(&mut self, cpu_info, &mut instruction_data, condition_code.unwrap_or(COND_ALWAYS))?;
@@ -542,11 +542,16 @@ impl CPUState {
 }
 
 fn handle_base_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize> {
+    if instruction_data.len() < 2 {
+        todo!("General protection fault, not enough data")
+    }
     let first_byte = instruction_data[0];
+    let second_byte = instruction_data[1];
     if first_byte & 0x40 == 0 {
-        let second_byte = instruction_data[1];
         if second_byte & 0x3 == 0 {
             handle_base_register_operation(cpu_state, cpu_info, memory, instruction_data, condition_code, rex)
+        } else if second_byte & 0x3 == 1 && second_byte & 0x18 == 8 && cpu_info.cpuid_1 & CP1_FI != 0{
+            handle_base_full_immediate_operation(cpu_state, cpu_info, memory, instruction_data, condition_code, rex)
         } else {
             handle_base_mem_operation(cpu_state, cpu_info, memory, instruction_data, condition_code, rex)
         }
@@ -620,27 +625,27 @@ fn handle_base_register_operation(cpu_state: &mut CPUState, cpu_info: &CPUInfo, 
             10 => {
                 // load
                 let address = address_width.sign_extend(register_b.borrow().value) as usize;
-                let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0)?;
+                let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
                 register_a.borrow_mut().write(cpu_info, size, true, data);
             }
             11 => {
                 // store
                 let value = register_a.borrow().read(cpu_info, size);
                 let address = address_width.sign_extend(register_b.borrow().value) as usize;
-                memory.write(address, size, value, cpu_info.feat & FT_UMA != 0)?;
+                memory.write(address, size, value, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
             }
             12 => {
                 // pop
                 let stack_pointer = register_b.borrow().value.wrapping_sub(address_width.num_bytes() as u64);
                 let address = address_width.sign_extend(stack_pointer) as usize;
-                memory.write(address, size, register_b.borrow().value, cpu_info.feat & FT_UMA != 0)?;
+                memory.write(address, size, register_b.borrow().value, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
                 register_b.borrow_mut().write(cpu_info, address_width, false, address as u64);
             }
             13 => {
                 // push
                 let stack_pointer = register_a.borrow().value.wrapping_sub(address_width.num_bytes() as u64);
                 let address = address_width.sign_extend(stack_pointer) as usize;
-                memory.write(address, size, register_b.borrow().value, cpu_info.feat & FT_UMA != 0)?;
+                memory.write(address, size, register_b.borrow().value, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
                 register_a.borrow_mut().write(cpu_info, address_width, false, address as u64);
             }
             14 => {
@@ -705,14 +710,14 @@ fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUI
             10 => {
                 // load
                 let address = address_width.sign_extend(immediate) as usize;
-                let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0)?;
+                let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
                 register.write(cpu_info, size, true, data);
             }
             11 => {
                 // store
                 let value = register.read(cpu_info, size);
                 let address = address_width.sign_extend(immediate) as usize;
-                memory.write(address, size, value, cpu_info.feat & FT_UMA != 0)?;
+                memory.write(address, size, value, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
             }
             12 => {
                 // slo
@@ -723,7 +728,7 @@ fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUI
                 // push
                 let value = register.value.wrapping_sub(address_width.num_bytes() as u64);
                 let address = address_width.sign_extend(value) as usize;
-                memory.write(address, size, immediate, cpu_info.feat & FT_UMA != 0)?;
+                memory.write(address, size, immediate, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
                 register.write(cpu_info, address_width, false, address as u64);
             }
             14 => {
@@ -743,6 +748,145 @@ fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUI
     }
 
     Ok(2)
+}
+
+fn handle_base_full_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize> {
+    let first_byte = instruction_data[0];
+    let second_byte = instruction_data[1];
+    let operation = first_byte & 0xF;
+    let size = ValueSize::from_u8((first_byte >> 4) & 0x3);
+    let register_index = if rex.a {
+        ((second_byte >> 5) & 0x7) | 8
+    } else {
+        (second_byte >> 5) & 0x7
+    } as usize;
+    let required_immediate_bytes: usize = if second_byte & 4 == 0 {
+        // i8
+        1
+    } else {
+        // iS
+        match size {
+            ValueSize::HALF => 1,
+            ValueSize::WORD => 2,
+            ValueSize::DOUBLE => 4,
+            ValueSize::QUAD => {
+                if rex.q {
+                    8
+                } else {
+                    4
+                }
+            }
+        }
+    };
+    
+    if instruction_data.len() < required_immediate_bytes + 2 {
+        todo!("General protection fault, not enough data")
+    }
+    
+    let immediate = match required_immediate_bytes {
+        1 => {
+            instruction_data[2] as u64
+        }
+        2 => {
+            u16::from_le_bytes(instruction_data.as_slices().0[2..4].try_into().unwrap()) as u64
+        }
+        4 => {
+            u32::from_le_bytes(instruction_data.as_slices().0[2..6].try_into().unwrap()) as u64
+        }
+        8 => {
+            u64::from_le_bytes(instruction_data.as_slices().0[2..10].try_into().unwrap())
+        }
+        _ => unreachable!()
+    };
+    let immediate = if operation < 8 || operation == 9 {
+        if size == ValueSize::QUAD && !rex.q {
+            ValueSize::DOUBLE.sign_extend(immediate)
+        } else {
+            size.sign_extend(immediate)
+        }
+    } else {
+        immediate
+    };
+    
+    if operation == 13 && cpu_info.cpuid_1 & CP1_SAF == 0 {
+        // SAF not supported
+        todo!("Illegal instruction")
+    } else if operation == 13 && cpu_info.cpuid_1 & CP1_ASP == 0 && register_index != 6 {
+        // ASP not supported
+        todo!("Illegal instruction")
+    }
+
+    let address_width = cpu_state.address_width();
+    let register = &mut cpu_state.registers[register_index].get_mut();
+
+    if operation < 8 {
+        let (result, flags) = perform_base_operation(operation as u64, register.read(cpu_info, size), immediate, size);
+        if let Some(result) = result {
+            register.write(cpu_info, size, true, result)
+        }
+        cpu_state.cr_flags = flags
+    } else {
+        match operation {
+            8 => {
+                // movz
+                register.write(cpu_info, size, false, immediate);
+            }
+            9 => {
+                // movs
+                register.write(cpu_info, size, true, immediate);
+            }
+            10 => {
+                // load
+                let address = address_width.sign_extend(immediate) as usize;
+                let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
+                register.write(cpu_info, size, true, data);
+            }
+            11 => {
+                // store
+                let value = register.read(cpu_info, size);
+                let address = address_width.sign_extend(immediate) as usize;
+                memory.write(address, size, value, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
+            }
+            12 => {
+                // slo
+                match cpu_info.undefined_behavior_mode {
+                    UndefinedBehaviorMode::Relaxed => {
+                        let new_value = (register.read(cpu_info, size) << 5) | (immediate & 0x1F);
+                        register.write(cpu_info, size, true, new_value);
+                    }
+                    UndefinedBehaviorMode::Strict => {
+                        todo!("Illegal instruction")
+                    }
+                    UndefinedBehaviorMode::Evil => {
+                        let new_value = (register.read(cpu_info, size) << 5) | immediate;
+                        register.write(cpu_info, size, true, new_value);
+                    }
+                }
+            }
+            13 => {
+                // push
+                let value = register.value.wrapping_sub(address_width.num_bytes() as u64);
+                let address = address_width.sign_extend(value) as usize;
+                memory.write(address, size, immediate, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
+                register.write(cpu_info, address_width, false, address as u64);
+            }
+            14 => {
+                // readcr
+                let data = read_cr(&mut cpu_state, cpu_info, immediate as usize)?;
+                // needed to drop the old reference before calling read_cr
+                let register = &mut cpu_state.registers[register_index];
+                register.get_mut().write(cpu_info, size, true, data);
+            }
+            15 => {
+                // writecr
+                let data = register.read(cpu_info, size);
+                write_cr(&mut cpu_state, cpu_info, immediate as usize, data)?;
+            }
+            _ => unreachable!()
+        }
+    }
+    
+    Ok(required_immediate_bytes + 2)
 }
 
 fn handle_base_mem_operation(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize> {
@@ -1100,6 +1244,9 @@ fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, instructi
 
     let (immediate, read_bytes) = match size {
         ValueSize::HALF => {
+            if instruction_data.len() < 2 {
+                todo!("General protection fault, not enough data")
+            }
             let value = if !absolute {
                 instruction_data[1] as usize | !(u8::MAX as usize)
             } else {
@@ -1108,6 +1255,9 @@ fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, instructi
             (value, 2)
         }
         ValueSize::WORD => {
+            if instruction_data.len() < 3 {
+                todo!("General protection fault, not enough data")
+            }
             let value = u16::from_le_bytes(instruction_data.as_slices().0[1..3].try_into().unwrap()) as usize;
             let value = if !absolute {
                 value | !(u16::MAX as usize)
@@ -1117,6 +1267,9 @@ fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, instructi
             (value, 3)
         }
         ValueSize::DOUBLE => {
+            if instruction_data.len() < 5 {
+                todo!("General protection fault, not enough data")
+            }
             let value = u32::from_le_bytes(instruction_data.as_slices().0[1..5].try_into().unwrap()) as usize;
             let value = if !absolute {
                 value | !(u32::MAX as usize)
@@ -1126,6 +1279,9 @@ fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, instructi
             (value, 5)
         }
         ValueSize::QUAD => {
+            if instruction_data.len() < 9 {
+                todo!("General protection fault, not enough data")
+            }
             let value = u64::from_le_bytes(instruction_data.as_slices().0[1..9].try_into().unwrap()) as usize;
             (value, 9)
         }
