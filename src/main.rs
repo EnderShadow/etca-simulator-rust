@@ -16,5 +16,5 @@ fn main() {
     for line in memory.dump_memory_map() {
         println!("{}", line)
     }
-    let _ = tick(cpu_state, &cpu_info, &mut memory).unwrap();
+    let _ = cpu_state.tick(&cpu_info, &mut memory).unwrap();
 }

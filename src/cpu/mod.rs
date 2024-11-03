@@ -351,192 +351,194 @@ impl REX {
     }
 }
 
-#[bitmatch]
-pub fn tick(mut cpu_state: CPUState, cpu_info: &CPUInfo, memory: &mut Memory) -> Result<CPUState> {
-    // instruction_data is assumed to be contiguous since data is never added to it after read_instruction_data returns
-    let instruction_data = memory.read_instruction_data(cpu_state.instruction_pointer);
-    let mut instruction_data = VecDeque::from(instruction_data);
-
-    if instruction_data.len() < 1 {
-        if cpu_info.cpuid_1 & CP1_INT != 0 {
-            todo!("General Protection Fault, no data at address")
-        } else {
-            return Err(CPUError::Memory(MemoryError::UnmappedMemory(cpu_state.instruction_pointer)))
-        }
-    }
-
-    let mut instruction_size = 0usize;
-    let mut condition_code: Option<u8> = None;
-    let mut rex: Option<u8> = None;
-
-    // look for prefixes
-    let prefix = instruction_data[0];
-    if cpu_info.cpuid_1 & CP1_COND != 0 && prefix & 0xF0 == 0b1010_0000 && prefix & 0b1110 != 0b1110 {
-        condition_code = Some(prefix & 0xF);
-        instruction_data.pop_front();
-        instruction_size += 1;
-    } else if cpu_info.cpuid_1 & CP1_REX != 0 && prefix & 0xF0 == 0b1100_0000 {
-        rex = Some(prefix & 0xF);
-        instruction_data.pop_front();
-        instruction_size += 1;
-    }
-
-    if instruction_data.len() < 1 {
-        if cpu_info.cpuid_1 & CP1_INT != 0 {
-            todo!("General Protection Fault, no data at address")
-        } else {
-            return Err(CPUError::Memory(MemoryError::UnmappedMemory(cpu_state.instruction_pointer + instruction_size)))
-        }
-    }
-
-    let prefix = instruction_data[0];
-    if rex.is_none() && cpu_info.cpuid_1 & CP1_REX != 0 && prefix & 0xF0 == 0b1100_0000 {
-        rex = Some(prefix & 0xF);
-        instruction_data.pop_front();
-        instruction_size += 1;
-    }
-
-    let rex = REX::new(rex.unwrap_or(0));
-
-    // prefixes have been parsed
-
-    if instruction_data.len() < 1 {
-        if cpu_info.cpuid_1 & CP1_INT != 0 {
-            todo!("General Protection Fault, no data at address")
-        } else {
-            return Err(CPUError::Memory(MemoryError::UnmappedMemory(cpu_state.instruction_pointer + instruction_size)))
-        }
-    }
-
-    let first_byte = instruction_data[0];
+impl CPUState {
     #[bitmatch]
-    match first_byte {
-        "0???_????" => {
-            let used_bytes = handle_base_operations(&mut cpu_state, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex)?;
-            cpu_state.instruction_pointer += instruction_size + used_bytes;
-        }
-        "100?_????" => {
-            // base isa relative immediate jump
-            if instruction_data.len() >= 2 && condition_code.is_none() {
-                // cache instructions in the non-canonical NOP section are ignored since there is no cache
-                let condition_code = first_byte & 0xF;
-                let displacement = instruction_data[1] as usize;
-                let offset = if first_byte & 0x10 != 0 {
-                    displacement | !255usize
-                } else {
-                    displacement
-                };
-                if check_condition(condition_code, cpu_state.cr_flags) {
-                    cpu_state.instruction_pointer = cpu_state.instruction_pointer.wrapping_add(offset);
-                } else {
-                    cpu_state.instruction_pointer += instruction_size + 2;
-                }
-            } else if instruction_data.len() < 2 {
-                // not enough bytes
-                todo!("Handle exceptional situation")
+    pub fn tick(mut self, cpu_info: &CPUInfo, memory: &mut Memory) -> Result<CPUState> {
+        // instruction_data is assumed to be contiguous since data is never added to it after read_instruction_data returns
+        let instruction_data = memory.read_instruction_data(self.instruction_pointer);
+        let mut instruction_data = VecDeque::from(instruction_data);
+
+        if instruction_data.len() < 1 {
+            if cpu_info.cpuid_1 & CP1_INT != 0 {
+                todo!("General Protection Fault, no data at address")
             } else {
-                // conditional prefix on a conditional jump
-                todo!("Illegal instruction")
+                return Err(CPUError::Memory(MemoryError::UnmappedMemory(self.instruction_pointer)))
             }
         }
-        "1010_0???" => {
-            // multiple conditional prefixes
-            todo!("Illegal instruction")
-        }
-        "1010_10??" => {
-            // multiple conditional prefixes
-            todo!("Illegal instruction")
-        }
-        "1010_110?" => {
-            // multiple conditional prefixes
-            todo!("Illegal instruction")
-        }
-        "1010_1110" => {
-            // single byte NOP
 
-            // there is technically nothing preventing this from being implemented without a VWI extension
-            if cpu_info.force_allow_single_byte_nop || cpu_info.cpuid_1 & 0x2031 != 0 || cpu_info.cpuid_2 & 0x3 != 0 {
-                // condition code does not matter since a skipped nop is the same as an executed nop
-                cpu_state.instruction_pointer += instruction_size + 1;
+        let mut instruction_size = 0usize;
+        let mut condition_code: Option<u8> = None;
+        let mut rex: Option<u8> = None;
+
+        // look for prefixes
+        let prefix = instruction_data[0];
+        if cpu_info.cpuid_1 & CP1_COND != 0 && prefix & 0xF0 == 0b1010_0000 && prefix & 0b1110 != 0b1110 {
+            condition_code = Some(prefix & 0xF);
+            instruction_data.pop_front();
+            instruction_size += 1;
+        } else if cpu_info.cpuid_1 & CP1_REX != 0 && prefix & 0xF0 == 0b1100_0000 {
+            rex = Some(prefix & 0xF);
+            instruction_data.pop_front();
+            instruction_size += 1;
+        }
+
+        if instruction_data.len() < 1 {
+            if cpu_info.cpuid_1 & CP1_INT != 0 {
+                todo!("General Protection Fault, no data at address")
             } else {
-                todo!("Illegal instruction")
+                return Err(CPUError::Memory(MemoryError::UnmappedMemory(self.instruction_pointer + instruction_size)))
             }
         }
-        "1010_1111" => {
-            // SAF register jump/call
-            if instruction_data.len() >= 2 && cpu_info.cpuid_1 & CP1_SAF != 0 {
-                if condition_code.is_none() {
-                    let second_byte = instruction_data[1];
-                    let call = second_byte & 0x10 != 0;
-                    let condition_code = second_byte & 0xF;
-                    let register_index = if rex.a {
-                        (second_byte >> 5) | 8
-                    } else {
-                        second_byte >> 5
-                    } as usize;
 
-                    if check_condition(condition_code, cpu_state.cr_flags) {
-                        if call {
-                            cpu_state.registers[7].get_mut().value = (cpu_state.instruction_pointer + instruction_size + 2) as u64;
-                        }
-                        cpu_state.instruction_pointer = cpu_state.registers[register_index].borrow().value as usize;
+        let prefix = instruction_data[0];
+        if rex.is_none() && cpu_info.cpuid_1 & CP1_REX != 0 && prefix & 0xF0 == 0b1100_0000 {
+            rex = Some(prefix & 0xF);
+            instruction_data.pop_front();
+            instruction_size += 1;
+        }
+
+        let rex = REX::new(rex.unwrap_or(0));
+
+        // prefixes have been parsed
+
+        if instruction_data.len() < 1 {
+            if cpu_info.cpuid_1 & CP1_INT != 0 {
+                todo!("General Protection Fault, no data at address")
+            } else {
+                return Err(CPUError::Memory(MemoryError::UnmappedMemory(self.instruction_pointer + instruction_size)))
+            }
+        }
+
+        let first_byte = instruction_data[0];
+        #[bitmatch]
+        match first_byte {
+            "0???_????" => {
+                let used_bytes = handle_base_operations(&mut self, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex)?;
+                self.instruction_pointer += instruction_size + used_bytes;
+            }
+            "100?_????" => {
+                // base isa relative immediate jump
+                if instruction_data.len() >= 2 && condition_code.is_none() {
+                    // cache instructions in the non-canonical NOP section are ignored since there is no cache
+                    let condition_code = first_byte & 0xF;
+                    let displacement = instruction_data[1] as usize;
+                    let offset = if first_byte & 0x10 != 0 {
+                        displacement | !255usize
                     } else {
-                        cpu_state.instruction_pointer += instruction_size + 2;
+                        displacement
+                    };
+                    if check_condition(condition_code, self.cr_flags) {
+                        self.instruction_pointer = self.instruction_pointer.wrapping_add(offset);
+                    } else {
+                        self.instruction_pointer += instruction_size + 2;
                     }
+                } else if instruction_data.len() < 2 {
+                    // not enough bytes
+                    todo!("Handle exceptional situation")
                 } else {
-                    // conditional prefix on a conditional jump/call
+                    // conditional prefix on a conditional jump
                     todo!("Illegal instruction")
                 }
-            } else if instruction_data.len() < 2 {
-                // not enough bytes
-                todo!("Handle exceptional situation")
-            } else {
-                // SAF is unsupported
+            }
+            "1010_0???" => {
+                // multiple conditional prefixes
                 todo!("Illegal instruction")
             }
-        }
-        "1011_????" => {
-            // SAF relative immediate call
-            if instruction_data.len() >= 2 && cpu_info.cpuid_1 & CP1_SAF != 0 {
-                let second_byte = instruction_data[1];
-                let displacement = second_byte as usize | ((first_byte as usize & 0xF) << 8);
-                let displacement = if displacement & 0x800 != 0 {
-                    displacement | !0xFFF
-                } else {
-                    displacement
-                };
+            "1010_10??" => {
+                // multiple conditional prefixes
+                todo!("Illegal instruction")
+            }
+            "1010_110?" => {
+                // multiple conditional prefixes
+                todo!("Illegal instruction")
+            }
+            "1010_1110" => {
+                // single byte NOP
 
-                if check_condition(condition_code.unwrap_or(COND_ALWAYS), cpu_state.cr_flags) {
-                    cpu_state.registers[7].get_mut().value = (cpu_state.instruction_pointer + instruction_size + 2) as u64;
-                    cpu_state.instruction_pointer = cpu_state.instruction_pointer.wrapping_add(displacement);
+                // there is technically nothing preventing this from being implemented without a VWI extension
+                if cpu_info.force_allow_single_byte_nop || cpu_info.cpuid_1 & 0x2031 != 0 || cpu_info.cpuid_2 & 0x3 != 0 {
+                    // condition code does not matter since a skipped nop is the same as an executed nop
+                    self.instruction_pointer += instruction_size + 1;
                 } else {
-                    cpu_state.instruction_pointer += instruction_size + 2;
+                    todo!("Illegal instruction")
                 }
-            } else if instruction_data.len() < 2 {
-                // not enough bytes
-                todo!("Handle exceptional situation")
-            } else {
-                // SAF not supported
+            }
+            "1010_1111" => {
+                // SAF register jump/call
+                if instruction_data.len() >= 2 && cpu_info.cpuid_1 & CP1_SAF != 0 {
+                    if condition_code.is_none() {
+                        let second_byte = instruction_data[1];
+                        let call = second_byte & 0x10 != 0;
+                        let condition_code = second_byte & 0xF;
+                        let register_index = if rex.a {
+                            (second_byte >> 5) | 8
+                        } else {
+                            second_byte >> 5
+                        } as usize;
+
+                        if check_condition(condition_code, self.cr_flags) {
+                            if call {
+                                self.registers[7].get_mut().value = (self.instruction_pointer + instruction_size + 2) as u64;
+                            }
+                            self.instruction_pointer = self.registers[register_index].borrow().value as usize;
+                        } else {
+                            self.instruction_pointer += instruction_size + 2;
+                        }
+                    } else {
+                        // conditional prefix on a conditional jump/call
+                        todo!("Illegal instruction")
+                    }
+                } else if instruction_data.len() < 2 {
+                    // not enough bytes
+                    todo!("Handle exceptional situation")
+                } else {
+                    // SAF is unsupported
+                    todo!("Illegal instruction")
+                }
+            }
+            "1011_????" => {
+                // SAF relative immediate call
+                if instruction_data.len() >= 2 && cpu_info.cpuid_1 & CP1_SAF != 0 {
+                    let second_byte = instruction_data[1];
+                    let displacement = second_byte as usize | ((first_byte as usize & 0xF) << 8);
+                    let displacement = if displacement & 0x800 != 0 {
+                        displacement | !0xFFF
+                    } else {
+                        displacement
+                    };
+
+                    if check_condition(condition_code.unwrap_or(COND_ALWAYS), self.cr_flags) {
+                        self.registers[7].get_mut().value = (self.instruction_pointer + instruction_size + 2) as u64;
+                        self.instruction_pointer = self.instruction_pointer.wrapping_add(displacement);
+                    } else {
+                        self.instruction_pointer += instruction_size + 2;
+                    }
+                } else if instruction_data.len() < 2 {
+                    // not enough bytes
+                    todo!("Handle exceptional situation")
+                } else {
+                    // SAF not supported
+                    todo!("Illegal instruction")
+                }
+            }
+            "110?_????" => {
+                // multiple REX prefixes or illegal prefix
                 todo!("Illegal instruction")
             }
+            "1110_????" => {
+                let used_bytes = handle_exop_operations(&mut self, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(COND_ALWAYS), rex)?;
+                todo!()
+            }
+            "1111_????" => {
+                let used_bytes = handle_exop_jump_call(&mut self, cpu_info, &mut instruction_data, condition_code.unwrap_or(COND_ALWAYS))?;
+                self.instruction_pointer += instruction_size + used_bytes;
+            }
         }
-        "110?_????" => {
-            // multiple REX prefixes or illegal prefix
-            todo!("Illegal instruction")
-        }
-        "1110_????" => {
-            let used_bytes = handle_exop_operations(&mut cpu_state, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(COND_ALWAYS), rex)?;
-            todo!()
-        }
-        "1111_????" => {
-            let used_bytes = handle_exop_jump_call(&mut cpu_state, cpu_info, &mut instruction_data, condition_code.unwrap_or(COND_ALWAYS))?;
-            cpu_state.instruction_pointer += instruction_size + used_bytes;
-        }
+
+        self.instruction_pointer = self.address_width().sign_extend(self.instruction_pointer as u64) as usize;
+
+        Ok(self)
     }
-
-    cpu_state.instruction_pointer = cpu_state.address_width().sign_extend(cpu_state.instruction_pointer as u64) as usize;
-
-    Ok(cpu_state)
 }
 
 fn handle_base_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize> {
