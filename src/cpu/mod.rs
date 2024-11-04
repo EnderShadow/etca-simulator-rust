@@ -782,70 +782,72 @@ fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUI
         // ASP not supported
         return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "ASP is not specified in the CPUID.".to_string()))
     }
+    
+    if check_condition(condition_code, cpu_state.cr_flags) {
+        let address_width = cpu_state.address_width();
+        let register = &mut cpu_state.registers[register_index].get_mut();
 
-    let address_width = cpu_state.address_width();
-    let register = &mut cpu_state.registers[register_index].get_mut();
-
-    if operation < 8 {
-        let (result, flags) = perform_base_operation(operation as u64, register.read(cpu_info, size), immediate, size);
-        if let Some(result) = result {
-            register.write(cpu_info, size, true, result)
-        }
-        cpu_state.cr_flags = flags
-    } else {
-        match operation {
-            8 => {
-                // movz
-                register.write(cpu_info, size, false, immediate);
+        if operation < 8 {
+            let (result, flags) = perform_base_operation(operation as u64, register.read(cpu_info, size), immediate, size);
+            if let Some(result) = result {
+                register.write(cpu_info, size, true, result)
             }
-            9 => {
-                // movs
-                register.write(cpu_info, size, true, immediate);
+            cpu_state.cr_flags = flags
+        } else {
+            match operation {
+                8 => {
+                    // movz
+                    register.write(cpu_info, size, false, immediate);
+                }
+                9 => {
+                    // movs
+                    register.write(cpu_info, size, true, immediate);
+                }
+                10 => {
+                    // load
+                    let address = address_width.sign_extend(immediate) as usize;
+                    let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
+                    register.write(cpu_info, size, true, data);
+                }
+                11 => {
+                    // store
+                    let value = register.read(cpu_info, size);
+                    let address = address_width.sign_extend(immediate) as usize;
+                    memory.write(address, size, value, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
+                }
+                12 => {
+                    // slo
+                    let new_value = (register.read(cpu_info, size) << 5) | immediate;
+                    register.write(cpu_info, size, true, new_value);
+                }
+                13 => {
+                    // push
+                    let value = register.value.wrapping_sub(address_width.num_bytes() as u64);
+                    let address = address_width.sign_extend(value) as usize;
+                    memory.write(address, size, immediate, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
+                    register.write(cpu_info, address_width, false, address as u64);
+                }
+                14 => {
+                    // readcr
+                    let data = read_cr(cpu_state, cpu_info, immediate)?;
+                    // needed to drop the old reference before calling read_cr
+                    let register = &mut cpu_state.registers[register_index];
+                    register.get_mut().write(cpu_info, size, true, data);
+                }
+                15 => {
+                    // writecr
+                    let data = register.read(cpu_info, size);
+                    write_cr(cpu_state, cpu_info, immediate, data)?;
+                }
+                _ => unreachable!()
             }
-            10 => {
-                // load
-                let address = address_width.sign_extend(immediate) as usize;
-                let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
-                register.write(cpu_info, size, true, data);
-            }
-            11 => {
-                // store
-                let value = register.read(cpu_info, size);
-                let address = address_width.sign_extend(immediate) as usize;
-                memory.write(address, size, value, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
-            }
-            12 => {
-                // slo
-                let new_value = (register.read(cpu_info, size) << 5) | immediate;
-                register.write(cpu_info, size, true, new_value);
-            }
-            13 => {
-                // push
-                let value = register.value.wrapping_sub(address_width.num_bytes() as u64);
-                let address = address_width.sign_extend(value) as usize;
-                memory.write(address, size, immediate, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
-                register.write(cpu_info, address_width, false, address as u64);
-            }
-            14 => {
-                // readcr
-                let data = read_cr(&mut cpu_state, cpu_info, immediate)?;
-                // needed to drop the old reference before calling read_cr
-                let register = &mut cpu_state.registers[register_index];
-                register.get_mut().write(cpu_info, size, true, data);
-            }
-            15 => {
-                // writecr
-                let data = register.read(cpu_info, size);
-                write_cr(&mut cpu_state, cpu_info, immediate, data)?;
-            }
-            _ => unreachable!()
         }
     }
 
     Ok(2)
 }
 
-fn handle_base_full_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize> {
+fn handle_base_full_immediate_operation(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize> {
     let first_byte = instruction_data[0];
     let second_byte = instruction_data[1];
     let operation = first_byte & 0xF;
@@ -915,73 +917,75 @@ fn handle_base_full_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: 
         return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "ASP is not specified in the CPUID.".to_string()))
     }
 
-    let address_width = cpu_state.address_width();
-    let register = &mut cpu_state.registers[register_index].get_mut();
+    if check_condition(condition_code, cpu_state.cr_flags) {
+        let address_width = cpu_state.address_width();
+        let register = &mut cpu_state.registers[register_index].get_mut();
 
-    if operation < 8 {
-        let (result, flags) = perform_base_operation(operation as u64, register.read(cpu_info, size), immediate, size);
-        if let Some(result) = result {
-            register.write(cpu_info, size, true, result)
-        }
-        cpu_state.cr_flags = flags
-    } else {
-        match operation {
-            8 => {
-                // movz
-                register.write(cpu_info, size, false, immediate);
+        if operation < 8 {
+            let (result, flags) = perform_base_operation(operation as u64, register.read(cpu_info, size), immediate, size);
+            if let Some(result) = result {
+                register.write(cpu_info, size, true, result)
             }
-            9 => {
-                // movs
-                register.write(cpu_info, size, true, immediate);
-            }
-            10 => {
-                // load
-                let address = address_width.sign_extend(immediate) as usize;
-                let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
-                register.write(cpu_info, size, true, data);
-            }
-            11 => {
-                // store
-                let value = register.read(cpu_info, size);
-                let address = address_width.sign_extend(immediate) as usize;
-                memory.write(address, size, value, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
-            }
-            12 => {
-                // slo
-                match cpu_info.undefined_behavior_mode {
-                    UndefinedBehaviorMode::Relaxed => {
-                        let new_value = (register.read(cpu_info, size) << 5) | (immediate & 0x1F);
-                        register.write(cpu_info, size, true, new_value);
-                    }
-                    UndefinedBehaviorMode::Strict => {
-                        return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "SLO is unspecified behavior when used with a full immediate.".to_string()))
-                    }
-                    UndefinedBehaviorMode::Evil => {
-                        let new_value = (register.read(cpu_info, size) << 5) | immediate;
-                        register.write(cpu_info, size, true, new_value);
+            cpu_state.cr_flags = flags
+        } else {
+            match operation {
+                8 => {
+                    // movz
+                    register.write(cpu_info, size, false, immediate);
+                }
+                9 => {
+                    // movs
+                    register.write(cpu_info, size, true, immediate);
+                }
+                10 => {
+                    // load
+                    let address = address_width.sign_extend(immediate) as usize;
+                    let data = memory.read(address, size, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
+                    register.write(cpu_info, size, true, data);
+                }
+                11 => {
+                    // store
+                    let value = register.read(cpu_info, size);
+                    let address = address_width.sign_extend(immediate) as usize;
+                    memory.write(address, size, value, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
+                }
+                12 => {
+                    // slo
+                    match cpu_info.undefined_behavior_mode {
+                        UndefinedBehaviorMode::Relaxed => {
+                            let new_value = (register.read(cpu_info, size) << 5) | (immediate & 0x1F);
+                            register.write(cpu_info, size, true, new_value);
+                        }
+                        UndefinedBehaviorMode::Strict => {
+                            return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "SLO is unspecified behavior when used with a full immediate.".to_string()))
+                        }
+                        UndefinedBehaviorMode::Evil => {
+                            let new_value = (register.read(cpu_info, size) << 5) | immediate;
+                            register.write(cpu_info, size, true, new_value);
+                        }
                     }
                 }
+                13 => {
+                    // push
+                    let value = register.value.wrapping_sub(address_width.num_bytes() as u64);
+                    let address = address_width.sign_extend(value) as usize;
+                    memory.write(address, size, immediate, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
+                    register.write(cpu_info, address_width, false, address as u64);
+                }
+                14 => {
+                    // readcr
+                    let data = read_cr(cpu_state, cpu_info, immediate)?;
+                    // needed to drop the old reference before calling read_cr
+                    let register = &mut cpu_state.registers[register_index];
+                    register.get_mut().write(cpu_info, size, true, data);
+                }
+                15 => {
+                    // writecr
+                    let data = register.read(cpu_info, size);
+                    write_cr(cpu_state, cpu_info, immediate, data)?;
+                }
+                _ => unreachable!()
             }
-            13 => {
-                // push
-                let value = register.value.wrapping_sub(address_width.num_bytes() as u64);
-                let address = address_width.sign_extend(value) as usize;
-                memory.write(address, size, immediate, cpu_info.feat & FT_UMA != 0 || cpu_info.undefined_behavior_mode == UndefinedBehaviorMode::Relaxed)?;
-                register.write(cpu_info, address_width, false, address as u64);
-            }
-            14 => {
-                // readcr
-                let data = read_cr(cpu_state, cpu_info, immediate)?;
-                // needed to drop the old reference before calling read_cr
-                let register = &mut cpu_state.registers[register_index];
-                register.get_mut().write(cpu_info, size, true, data);
-            }
-            15 => {
-                // writecr
-                let data = register.read(cpu_info, size);
-                write_cr(cpu_state, cpu_info, immediate, data)?;
-            }
-            _ => unreachable!()
         }
     }
     
@@ -1071,7 +1075,7 @@ fn calculate_flags(input_a: u64, input_b: u64, result: u64, size: ValueSize) -> 
 // Also, since reading from and writing to reserved CRs is unspecified behavior, treating PM as implemented doesn't cause any issues since
 // the only way to make it not 1 on a system without PM is to write to a reserved CR.
 fn read_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: u64) -> Result<u64> {
-    let mut rng = rand::thread_rng();
+    let mut rng = thread_rng();
     if index >= 0x03 && index <= 0x0B && cpu_info.cpuid_1 & CP1_INT == 0 {
         match cpu_info.undefined_behavior_mode {
             UndefinedBehaviorMode::Relaxed => {} // let reserved control registers be accessed
@@ -1199,7 +1203,7 @@ fn read_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: u64) -> Result<u
 }
 
 fn write_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: u64, data: u64) -> Result<()> {
-    let mut rng = rand::thread_rng();
+    let mut rng = thread_rng();
     let data: u64 = if index >= 0x03 && index <= 0x0B && cpu_info.cpuid_1 & CP1_INT == 0 {
         match cpu_info.undefined_behavior_mode {
             UndefinedBehaviorMode::Relaxed => data, // use passed in value
@@ -1440,5 +1444,5 @@ fn check_condition(condition_code: u8, flags: u8) -> bool {
         _ => unreachable!("Impossible condition code reached")
     };
 
-    return result ^ invert;
+    result ^ invert
 }
