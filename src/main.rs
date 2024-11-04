@@ -7,7 +7,7 @@ use crate::mem::Memory;
 
 fn main() {
     let cpu_info = CPUInfo::new(ALL_CP1, ALL_CP2, ALL_FT, false, UndefinedBehaviorMode::Relaxed).unwrap();
-    let cpu_state = CPUState::new();
+    let mut cpu_state = CPUState::new();
     let mut memory = Memory::new();
     let mem_seg_size = NonZeroUsize::new(1 << 15).unwrap();
     memory.add_ram(0, mem_seg_size).unwrap();
@@ -16,5 +16,8 @@ fn main() {
     for line in memory.dump_memory_map() {
         println!("{}", line)
     }
-    let _ = cpu_state.tick(&cpu_info, &mut memory).unwrap();
+    let result = cpu_state.tick(&cpu_info, &mut memory);
+    if let Err(error) = result {
+        println!("{:?}", error);
+    }
 }

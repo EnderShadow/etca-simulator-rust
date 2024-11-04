@@ -5,7 +5,6 @@ use crate::mem::{Memory, MemoryError};
 use bitmatch::bitmatch;
 use rand::prelude::*;
 use thiserror::Error;
-use crate::cpu::CPUError::{InvalidValueSize, MissingCapabilities, ReservedControlRegister, UnsupportedCapabilities};
 
 mod tests;
 
@@ -59,15 +58,26 @@ pub enum CPUError {
     UnsupportedCapabilities(String),
     #[error("CPU is missing required capabilities or features: {0}")]
     MissingCapabilities(String),
-    #[error("Invalid value for size: {0}")]
+    #[error("Invalid value for size: {0}.")]
     InvalidValueSize(u8),
-    #[error("Cannot access reserved control register {0}")]
-    ReservedControlRegister(usize)
+    #[error("Cannot access reserved control register {0}.")]
+    ReservedControlRegister(usize, u64),
+    #[error("Illegal instruction at address {0}. {1}")]
+    IllegalInstruction(usize, String),
+    #[error("Not enough bytes to parse instruction at address {address}. Expected at least {expected_size} bytes but found {actual_size} bytes.")]
+    IncompleteInstruction {
+        address: usize,
+        expected_size: usize,
+        actual_size: usize
+    },
+    #[error("Attempted to access protected control register {1} at address {0}.")]
+    ProtectedControlRegister(usize, u64)
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub enum UndefinedBehaviorMode {
     Relaxed,
+    #[default]
     Strict,
     Evil
 }
@@ -84,33 +94,33 @@ pub struct CPUInfo {
 
 impl CPUInfo {
     pub fn new(cpuid_1: u64, cpuid_2: u64, feat: u64, force_allow_single_byte_nop: bool, undefined_behavior_mode: UndefinedBehaviorMode) -> Result<CPUInfo> {
-        expect_set!(ALL_CP1, cpuid_1, UnsupportedCapabilities(format!("CP1 has unknown bits set: {}", (ALL_CP1 & cpuid_1) ^ cpuid_1)));
-        expect_set!(ALL_CP2, cpuid_2, UnsupportedCapabilities(format!("CP2 has unknown bits set: {}", (ALL_CP2 & cpuid_2) ^ cpuid_2)));
-        expect_set!(ALL_FT, feat, UnsupportedCapabilities(format!("FT has unknown bits set: {}", (ALL_FT & feat) ^ feat)));
+        expect_set!(ALL_CP1, cpuid_1, CPUError::UnsupportedCapabilities(format!("CP1 has unknown bits set: {}", (ALL_CP1 & cpuid_1) ^ cpuid_1)));
+        expect_set!(ALL_CP2, cpuid_2, CPUError::UnsupportedCapabilities(format!("CP2 has unknown bits set: {}", (ALL_CP2 & cpuid_2) ^ cpuid_2)));
+        expect_set!(ALL_FT, feat, CPUError::UnsupportedCapabilities(format!("FT has unknown bits set: {}", (ALL_FT & feat) ^ feat)));
 
         if cpuid_1 & CP1_INT != 0 {
-            expect_set!(cpuid_1, CP1_SAF, MissingCapabilities("Interrupt extension requires Stack and Functions extension".to_string()));
-            expect_set!(feat, FT_VON, MissingCapabilities("Interrupt extension requires Von Neumann feature".to_string()));
+            expect_set!(cpuid_1, CP1_SAF, CPUError::MissingCapabilities("Interrupt extension requires Stack and Functions extension".to_string()));
+            expect_set!(feat, FT_VON, CPUError::MissingCapabilities("Interrupt extension requires Von Neumann feature".to_string()));
         }
 
         if cpuid_1 & CP1_ASP != 0 {
-            expect_set!(cpuid_1, CP1_SAF, MissingCapabilities("Arbitrary Stack Pointer extension requires Stack and Functions extension".to_string()));
+            expect_set!(cpuid_1, CP1_SAF, CPUError::MissingCapabilities("Arbitrary Stack Pointer extension requires Stack and Functions extension".to_string()));
         }
 
         if cpuid_1 & CP1_DWAS != 0 {
-            expect_set!(cpuid_1, CP1_DW, MissingCapabilities("Double Word Address Space extension requires Double Word extension".to_string()));
+            expect_set!(cpuid_1, CP1_DW, CPUError::MissingCapabilities("Double Word Address Space extension requires Double Word extension".to_string()));
         }
 
         if cpuid_1 & CP1_QWAS != 0 {
-            expect_set!(cpuid_1, CP1_QW, MissingCapabilities("Quad Word Address Space extension requires Quad Word extension".to_string()));
+            expect_set!(cpuid_1, CP1_QW, CPUError::MissingCapabilities("Quad Word Address Space extension requires Quad Word extension".to_string()));
         }
 
         if cpuid_2 & CP2_PM != 0 {
-            expect_set!(cpuid_1, CP1_INT, MissingCapabilities("Privileged Mode extension requires Interrupt extension".to_string()));
+            expect_set!(cpuid_1, CP1_INT, CPUError::MissingCapabilities("Privileged Mode extension requires Interrupt extension".to_string()));
         }
 
         if cpuid_2 & CP2_MD != 0 {
-            expect_set!(cpuid_2, CP2_EXOP, MissingCapabilities("Multiply Divide extension requires Expanded Opcodes extension".to_string()));
+            expect_set!(cpuid_2, CP2_EXOP, CPUError::MissingCapabilities("Multiply Divide extension requires Expanded Opcodes extension".to_string()));
         }
 
         if feat & FT_MMAI != 0 && cpuid_1 & CP1_MO2 == 0 && cpuid_2 & CP2_MO1 == 0 {
@@ -128,7 +138,7 @@ impl CPUInfo {
     }
 }
 
-#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq)]
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Debug)]
 pub enum ValueSize {
     HALF,
     WORD,
@@ -145,7 +155,7 @@ impl TryFrom<u8> for ValueSize {
             1 => Ok(ValueSize::WORD),
             2 => Ok(ValueSize::DOUBLE),
             3 => Ok(ValueSize::QUAD),
-            x => Err(InvalidValueSize(x))
+            x => Err(CPUError::InvalidValueSize(x))
         }
     }
 }
@@ -352,15 +362,70 @@ impl REX {
 }
 
 impl CPUState {
+    pub fn tick(&mut self, cpu_info: &CPUInfo, memory: &mut Memory) -> Result<()> {
+        let result: Result<()> = self.tick_internal(cpu_info, memory);
+        
+        if cpu_info.cpuid_1 & CP1_INT != 0 {
+            if let Err(error) = &result {
+                match error {
+                    CPUError::Memory(MemoryError::UnmappedMemory(address)) => {
+                        todo!();
+                        Ok(())
+                    }
+                    CPUError::Memory(MemoryError::UnalignedAccess {
+                        address,
+                        num_bytes
+                                     }
+                    ) => {
+                        todo!();
+                        Ok(())
+                    }
+                    CPUError::Memory(_) => result, // other memory errors only occur when setting up memory
+                    CPUError::UnsupportedCapabilities(_) => result, // will only occur when constructing cpu_info
+                    CPUError::MissingCapabilities(_) => result, // will only occur when constructing cpu_info
+                    CPUError::InvalidValueSize(_) => result, // should never happen
+                    CPUError::ReservedControlRegister(address, control_register) => {
+                        todo!();
+                        Ok(())
+                    }
+                    CPUError::IllegalInstruction(address, _) => {
+                        todo!();
+                        Ok(())
+                    }
+                    CPUError::IncompleteInstruction {
+                        address,
+                        expected_size,
+                        actual_size
+                    } => {
+                        todo!();
+                        Ok(())
+                    }
+                    CPUError::ProtectedControlRegister(address, control_register) => {
+                        todo!();
+                        Ok(())
+                    }
+                }
+            } else {
+                Ok(())
+            }
+        } else {
+            result
+        }
+    }
+    
     #[bitmatch]
-    pub fn tick(mut self, cpu_info: &CPUInfo, memory: &mut Memory) -> Result<CPUState> {
+    fn tick_internal(&mut self, cpu_info: &CPUInfo, memory: &mut Memory) -> Result<()> {
         // instruction_data is assumed to be contiguous since data is never added to it after read_instruction_data returns
         let instruction_data = memory.read_instruction_data(self.instruction_pointer);
         let mut instruction_data = VecDeque::from(instruction_data);
 
         if instruction_data.len() < 1 {
             if cpu_info.cpuid_1 & CP1_INT != 0 {
-                todo!("General Protection Fault, no data at address")
+                return Err(CPUError::IncompleteInstruction {
+                    address: self.instruction_pointer,
+                    expected_size: 1,
+                    actual_size: 0
+                })
             } else {
                 return Err(CPUError::Memory(MemoryError::UnmappedMemory(self.instruction_pointer)))
             }
@@ -384,7 +449,11 @@ impl CPUState {
 
         if instruction_data.len() < 1 {
             if cpu_info.cpuid_1 & CP1_INT != 0 {
-                todo!("General Protection Fault, no data at address")
+                return Err(CPUError::IncompleteInstruction {
+                    address: self.instruction_pointer,
+                    expected_size: 1,
+                    actual_size: 0
+                })
             } else {
                 return Err(CPUError::Memory(MemoryError::UnmappedMemory(self.instruction_pointer + instruction_size)))
             }
@@ -403,7 +472,11 @@ impl CPUState {
 
         if instruction_data.len() < 1 {
             if cpu_info.cpuid_1 & CP1_INT != 0 {
-                todo!("General Protection Fault, no data at address")
+                return Err(CPUError::IncompleteInstruction {
+                    address: self.instruction_pointer,
+                    expected_size: 1,
+                    actual_size: 0
+                })
             } else {
                 return Err(CPUError::Memory(MemoryError::UnmappedMemory(self.instruction_pointer + instruction_size)))
             }
@@ -413,7 +486,7 @@ impl CPUState {
         #[bitmatch]
         match first_byte {
             "0???_????" => {
-                let used_bytes = handle_base_operations(&mut self, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex)?;
+                let used_bytes = handle_base_operations(self, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(0xE), rex)?;
                 self.instruction_pointer += instruction_size + used_bytes;
             }
             "100?_????" => {
@@ -434,23 +507,27 @@ impl CPUState {
                     }
                 } else if instruction_data.len() < 2 {
                     // not enough bytes
-                    todo!("Handle exceptional situation")
+                    return Err(CPUError::IncompleteInstruction {
+                        address: self.instruction_pointer,
+                        expected_size: 2,
+                        actual_size: instruction_data.len()
+                    })
                 } else {
                     // conditional prefix on a conditional jump
-                    todo!("Illegal instruction")
+                    return Err(CPUError::IllegalInstruction(self.instruction_pointer, "Conditional prefix cannot be used with a conditional jump.".to_string()))
                 }
             }
             "1010_0???" => {
                 // multiple conditional prefixes
-                todo!("Illegal instruction")
+                return Err(CPUError::IllegalInstruction(self.instruction_pointer, "Conditional prefix cannot be used more than once on an instruction.".to_string()))
             }
             "1010_10??" => {
                 // multiple conditional prefixes
-                todo!("Illegal instruction")
+                return Err(CPUError::IllegalInstruction(self.instruction_pointer, "Conditional prefix cannot be used more than once on an instruction.".to_string()))
             }
             "1010_110?" => {
                 // multiple conditional prefixes
-                todo!("Illegal instruction")
+                return Err(CPUError::IllegalInstruction(self.instruction_pointer, "Conditional prefix cannot be used more than once on an instruction.".to_string()))
             }
             "1010_1110" => {
                 // single byte NOP
@@ -460,7 +537,7 @@ impl CPUState {
                     // condition code does not matter since a skipped nop is the same as an executed nop
                     self.instruction_pointer += instruction_size + 1;
                 } else {
-                    todo!("Illegal instruction")
+                    return Err(CPUError::IllegalInstruction(self.instruction_pointer, "Single byte NOP is not allowed without VLI extensions.".to_string()))
                 }
             }
             "1010_1111" => {
@@ -486,14 +563,18 @@ impl CPUState {
                         }
                     } else {
                         // conditional prefix on a conditional jump/call
-                        todo!("Illegal instruction")
+                        return Err(CPUError::IllegalInstruction(self.instruction_pointer, "Conditional prefix cannot be used with a conditional jump or call.".to_string()))
                     }
                 } else if instruction_data.len() < 2 {
                     // not enough bytes
-                    todo!("Handle exceptional situation")
+                    return Err(CPUError::IncompleteInstruction {
+                        address: self.instruction_pointer,
+                        expected_size: 2,
+                        actual_size: instruction_data.len()
+                    })
                 } else {
                     // SAF is unsupported
-                    todo!("Illegal instruction")
+                    return Err(CPUError::IllegalInstruction(self.instruction_pointer, "SAF is not present in the CPUID.".to_string()))
                 }
             }
             "1011_????" => {
@@ -515,35 +596,49 @@ impl CPUState {
                     }
                 } else if instruction_data.len() < 2 {
                     // not enough bytes
-                    todo!("Handle exceptional situation")
+                    return Err(CPUError::IncompleteInstruction {
+                        address: self.instruction_pointer,
+                        expected_size: 2,
+                        actual_size: instruction_data.len()
+                    })
                 } else {
                     // SAF not supported
-                    todo!("Illegal instruction")
+                    return Err(CPUError::IllegalInstruction(self.instruction_pointer, "SAF is not present in the CPUID.".to_string()))
                 }
             }
-            "110?_????" => {
+            "110r_????" => {
+                let is_rex = r == 0;
                 // multiple REX prefixes or illegal prefix
-                todo!("Illegal instruction")
+                let message = if is_rex {
+                    "REX cannot be used more than once on an instruction."
+                } else {
+                    "Unknown prefixes cannot be used."
+                };
+                return Err(CPUError::IllegalInstruction(self.instruction_pointer, message.to_string()))
             }
             "1110_????" => {
-                let used_bytes = handle_exop_operations(&mut self, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(COND_ALWAYS), rex)?;
+                let used_bytes = handle_exop_operations(self, cpu_info, memory, &mut instruction_data, condition_code.unwrap_or(COND_ALWAYS), rex)?;
                 self.instruction_pointer += instruction_size + used_bytes;
             }
             "1111_????" => {
-                let used_bytes = handle_exop_jump_call(&mut self, cpu_info, &mut instruction_data, condition_code.unwrap_or(COND_ALWAYS))?;
+                let used_bytes = handle_exop_jump_call(self, cpu_info, &mut instruction_data, condition_code.unwrap_or(COND_ALWAYS))?;
                 self.instruction_pointer += instruction_size + used_bytes;
             }
         }
 
         self.instruction_pointer = self.address_width().sign_extend(self.instruction_pointer as u64) as usize;
 
-        Ok(self)
+        Ok(())
     }
 }
 
 fn handle_base_operations(cpu_state: &mut CPUState, cpu_info: &CPUInfo, memory: &mut Memory, instruction_data: &mut VecDeque<u8>, condition_code: u8, rex: REX) -> Result<usize> {
     if instruction_data.len() < 2 {
-        todo!("General protection fault, not enough data")
+        return Err(CPUError::IncompleteInstruction {
+            address: cpu_state.instruction_pointer,
+            expected_size: 2,
+            actual_size: instruction_data.len()
+        })
     }
     let first_byte = instruction_data[0];
     let second_byte = instruction_data[1];
@@ -578,21 +673,21 @@ fn handle_base_register_operation(cpu_state: &mut CPUState, cpu_info: &CPUInfo, 
     
     if (operation == 12 || operation == 13) && cpu_info.cpuid_1 & CP1_SAF == 0 {
         // SAF not supported
-        todo!("Illegal instruction")
+        return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "SAF is not specified in the CPUID.".to_string()))
     } else if operation == 12 && cpu_info.cpuid_1 & CP1_ASP == 0 && register_index_b != 6 {
         // ASP not supported
-        todo!("Illegal instruction")
+        return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "ASP is not specified in the CPUID.".to_string()))
     } else if operation == 13 && cpu_info.cpuid_1 & CP1_ASP == 0 && register_index_a != 6 {
         // ASP not supported
-        todo!("Illegal instruction")
+        return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "ASP is not specified in the CPUID.".to_string()))
     }
     
     if operation == 14 {
         // illegal by spec
-        todo!("Illegal instruction")
+        return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "Illegal instruction by ISA specification.".to_string()))
     }
     if operation == 15 && (register_index_b > 1 || cpu_info.cpuid_1 & CP1_CI == 0) {
-        todo!("Illegal instruction")
+        return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "Unknown instructions cannot be used.".to_string()))
     }
     
     if !check_condition(condition_code, cpu_state.cr_flags) {
@@ -682,10 +777,10 @@ fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUI
 
     if operation == 13 && cpu_info.cpuid_1 & CP1_SAF == 0 {
         // SAF not supported
-        todo!("Illegal instruction")
+        return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "SAF is not specified in the CPUID.".to_string()))
     } else if operation == 13 && cpu_info.cpuid_1 & CP1_ASP == 0 && register_index != 6 {
         // ASP not supported
-        todo!("Illegal instruction")
+        return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "ASP is not specified in the CPUID.".to_string()))
     }
 
     let address_width = cpu_state.address_width();
@@ -733,7 +828,7 @@ fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUI
             }
             14 => {
                 // readcr
-                let data = read_cr(&mut cpu_state, cpu_info, immediate as usize)?;
+                let data = read_cr(&mut cpu_state, cpu_info, immediate)?;
                 // needed to drop the old reference before calling read_cr
                 let register = &mut cpu_state.registers[register_index];
                 register.get_mut().write(cpu_info, size, true, data);
@@ -741,7 +836,7 @@ fn handle_base_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: &CPUI
             15 => {
                 // writecr
                 let data = register.read(cpu_info, size);
-                write_cr(&mut cpu_state, cpu_info, immediate as usize, data)?;
+                write_cr(&mut cpu_state, cpu_info, immediate, data)?;
             }
             _ => unreachable!()
         }
@@ -780,7 +875,11 @@ fn handle_base_full_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: 
     };
     
     if instruction_data.len() < required_immediate_bytes + 2 {
-        todo!("General protection fault, not enough data")
+        return Err(CPUError::IncompleteInstruction {
+            address: cpu_state.instruction_pointer,
+            expected_size: required_immediate_bytes + 2,
+            actual_size: instruction_data.len()
+        })
     }
     
     let immediate = match required_immediate_bytes {
@@ -810,10 +909,10 @@ fn handle_base_full_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: 
     
     if operation == 13 && cpu_info.cpuid_1 & CP1_SAF == 0 {
         // SAF not supported
-        todo!("Illegal instruction")
+        return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "SAF is not specified in the CPUID.".to_string()))
     } else if operation == 13 && cpu_info.cpuid_1 & CP1_ASP == 0 && register_index != 6 {
         // ASP not supported
-        todo!("Illegal instruction")
+        return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "ASP is not specified in the CPUID.".to_string()))
     }
 
     let address_width = cpu_state.address_width();
@@ -855,7 +954,7 @@ fn handle_base_full_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: 
                         register.write(cpu_info, size, true, new_value);
                     }
                     UndefinedBehaviorMode::Strict => {
-                        todo!("Illegal instruction")
+                        return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, "SLO is unspecified behavior when used with a full immediate.".to_string()))
                     }
                     UndefinedBehaviorMode::Evil => {
                         let new_value = (register.read(cpu_info, size) << 5) | immediate;
@@ -872,7 +971,7 @@ fn handle_base_full_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: 
             }
             14 => {
                 // readcr
-                let data = read_cr(&mut cpu_state, cpu_info, immediate as usize)?;
+                let data = read_cr(cpu_state, cpu_info, immediate)?;
                 // needed to drop the old reference before calling read_cr
                 let register = &mut cpu_state.registers[register_index];
                 register.get_mut().write(cpu_info, size, true, data);
@@ -880,7 +979,7 @@ fn handle_base_full_immediate_operation(mut cpu_state: &mut CPUState, cpu_info: 
             15 => {
                 // writecr
                 let data = register.read(cpu_info, size);
-                write_cr(&mut cpu_state, cpu_info, immediate as usize, data)?;
+                write_cr(cpu_state, cpu_info, immediate, data)?;
             }
             _ => unreachable!()
         }
@@ -971,30 +1070,30 @@ fn calculate_flags(input_a: u64, input_b: u64, result: u64, size: ValueSize) -> 
 // Since cr_priv is initialized to 1 (system mode) and only matters when PM is implemented, it's ok to not check for the existence of PM.
 // Also, since reading from and writing to reserved CRs is unspecified behavior, treating PM as implemented doesn't cause any issues since
 // the only way to make it not 1 on a system without PM is to write to a reserved CR.
-fn read_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize) -> Result<u64> {
+fn read_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: u64) -> Result<u64> {
     let mut rng = rand::thread_rng();
     if index >= 0x03 && index <= 0x0B && cpu_info.cpuid_1 & CP1_INT == 0 {
         match cpu_info.undefined_behavior_mode {
             UndefinedBehaviorMode::Relaxed => {} // let reserved control registers be accessed
-            UndefinedBehaviorMode::Strict => return Err(ReservedControlRegister(index)),
+            UndefinedBehaviorMode::Strict => return Err(CPUError::ReservedControlRegister(cpu_state.instruction_pointer, index)),
             UndefinedBehaviorMode::Evil => return Ok(rng.gen()) // interrupt control registers and the flag control register will be randomized
         }
     } else if index >= 0x0C && index <= 0x0D && cpu_info.cpuid_2 & CP2_PM == 0 {
         match cpu_info.undefined_behavior_mode {
             UndefinedBehaviorMode::Relaxed => {} // let reserved control registers be accessed
-            UndefinedBehaviorMode::Strict => return Err(ReservedControlRegister(index)),
+            UndefinedBehaviorMode::Strict => return Err(CPUError::ReservedControlRegister(cpu_state.instruction_pointer, index)),
             UndefinedBehaviorMode::Evil => return Ok(0) // you'll always be unprivileged
         }
     } else if index >= 0x0E && index <= 0x10 && cpu_info.cpuid_1 & CP1_CI == 0 {
         match cpu_info.undefined_behavior_mode {
             UndefinedBehaviorMode::Relaxed => {} // let reserved control registers be accessed
-            UndefinedBehaviorMode::Strict => return Err(ReservedControlRegister(index)),
+            UndefinedBehaviorMode::Strict => return Err(CPUError::ReservedControlRegister(cpu_state.instruction_pointer, index)),
             UndefinedBehaviorMode::Evil => return Ok(rng.gen()) // unaligned cache registers go brrr (and non-power-of-two cache line size)
         }
     } else if index == 0x11 && cpu_info.cpuid_1 & (CP1_DWAS | CP1_QWAS) == 0 {
         match cpu_info.undefined_behavior_mode {
             UndefinedBehaviorMode::Relaxed => {} // let reserved control registers be accessed
-            UndefinedBehaviorMode::Strict => return Err(ReservedControlRegister(index)),
+            UndefinedBehaviorMode::Strict => return Err(CPUError::ReservedControlRegister(cpu_state.instruction_pointer, index)),
             UndefinedBehaviorMode::Evil => return Ok(u64::MAX) // whatever mode this is, it's definitely not 16 bit real mode
         }
     }
@@ -1007,56 +1106,56 @@ fn read_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize) -> Result
             if cpu_state.cr_priv == 1 {
                 Ok(cpu_state.cr_int_pc as u64)
             } else {
-                todo!("Handle exceptional state")
+                Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         5 => {
             if cpu_state.cr_priv == 1 {
                 Ok(cpu_state.cr_int_ret_pc as u64)
             } else {
-                todo!("Handle exceptional state")
+                Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         6 => {
             if cpu_state.cr_priv == 1 {
                 Ok(cpu_state.cr_int_mask)
             } else {
-                todo!("Handle exceptional state")
+                Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         7 => {
             if cpu_state.cr_priv == 1 {
                 Ok(cpu_state.cr_int_pending)
             } else {
-                todo!("Handle exceptional state")
+                Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         8 => {
             if cpu_state.cr_priv == 1 {
                 Ok(cpu_state.cr_int_cause)
             } else {
-                todo!("Handle exceptional state")
+                Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         9 => {
             if cpu_state.cr_priv == 1 {
                 Ok(cpu_state.cr_int_data)
             } else {
-                todo!("Handle exceptional state")
+                Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         10 => {
             if cpu_state.cr_priv == 1 {
                 Ok(cpu_state.cr_int_scratch_0)
             } else {
-                todo!("Handle exceptional state")
+                Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         11 => {
             if cpu_state.cr_priv == 1 {
                 Ok(cpu_state.cr_int_scratch_1)
             } else {
-                todo!("Handle exceptional state")
+                Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         12 => {
@@ -1066,7 +1165,7 @@ fn read_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize) -> Result
             if cpu_state.cr_priv == 1 {
                 Ok(cpu_state.cr_int_ret_priv as u64)
             } else {
-                todo!("Handle exceptional state")
+                Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         14 => {
@@ -1076,14 +1175,14 @@ fn read_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize) -> Result
             if cpu_state.cr_priv == 1 {
                 Ok(cpu_state.cr_no_cache_start as u64)
             } else {
-                todo!("Handle exceptional state")
+                Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         16 => {
             if cpu_state.cr_priv == 1 {
                 Ok(cpu_state.cr_no_cache_end as u64)
             } else {
-                todo!("Handle exceptional state")
+                Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         17 => {
@@ -1092,37 +1191,37 @@ fn read_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize) -> Result
         _ => {
             match cpu_info.undefined_behavior_mode {
                 UndefinedBehaviorMode::Relaxed => Ok(0),
-                UndefinedBehaviorMode::Strict => Err(ReservedControlRegister(index)),
+                UndefinedBehaviorMode::Strict => Err(CPUError::ReservedControlRegister(cpu_state.instruction_pointer, index)),
                 UndefinedBehaviorMode::Evil => Ok(rng.gen())
             }
         }
     }
 }
 
-fn write_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize, data: u64) -> Result<()> {
+fn write_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: u64, data: u64) -> Result<()> {
     let mut rng = rand::thread_rng();
     let data: u64 = if index >= 0x03 && index <= 0x0B && cpu_info.cpuid_1 & CP1_INT == 0 {
         match cpu_info.undefined_behavior_mode {
             UndefinedBehaviorMode::Relaxed => data, // use passed in value
-            UndefinedBehaviorMode::Strict => return Err(ReservedControlRegister(index)),
+            UndefinedBehaviorMode::Strict => return Err(CPUError::ReservedControlRegister(cpu_state.instruction_pointer, index)),
             UndefinedBehaviorMode::Evil => rng.gen() // interrupt control registers and the flag control register will be randomized
         }
     } else if index >= 0x0C && index <= 0x0D && cpu_info.cpuid_2 & CP2_PM == 0 {
         match cpu_info.undefined_behavior_mode {
             UndefinedBehaviorMode::Relaxed => data, // use passed in value
-            UndefinedBehaviorMode::Strict => return Err(ReservedControlRegister(index)),
+            UndefinedBehaviorMode::Strict => return Err(CPUError::ReservedControlRegister(cpu_state.instruction_pointer, index)),
             UndefinedBehaviorMode::Evil => 0 // you'll always be unprivileged
         }
     } else if index >= 0x0E && index <= 0x10 && cpu_info.cpuid_1 & CP1_CI == 0 {
         match cpu_info.undefined_behavior_mode {
             UndefinedBehaviorMode::Relaxed => data, // use passed in value
-            UndefinedBehaviorMode::Strict => return Err(ReservedControlRegister(index)),
+            UndefinedBehaviorMode::Strict => return Err(CPUError::ReservedControlRegister(cpu_state.instruction_pointer, index)),
             UndefinedBehaviorMode::Evil => rng.gen() // unaligned cache registers go brrr
         }
     } else if index == 0x11 && cpu_info.cpuid_1 & (CP1_DWAS | CP1_QWAS) == 0 {
         match cpu_info.undefined_behavior_mode {
             UndefinedBehaviorMode::Relaxed => data, // use passed in value
-            UndefinedBehaviorMode::Strict => return Err(ReservedControlRegister(index)),
+            UndefinedBehaviorMode::Strict => return Err(CPUError::ReservedControlRegister(cpu_state.instruction_pointer, index)),
             UndefinedBehaviorMode::Evil => u64::MAX // whatever mode this is, it's definitely not 16 bit real mode
         }
     } else {
@@ -1137,50 +1236,50 @@ fn write_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize, data: u6
             if cpu_state.cr_priv == 1 {
                 cpu_state.cr_int_pc = data as usize
             } else {
-                todo!("Handle exceptional state")
+                return Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         5 => {
             if cpu_state.cr_priv == 1 {
                 cpu_state.cr_int_ret_pc = data as usize
             } else {
-                todo!("Handle exceptional state")
+                return Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         6 => {
             if cpu_state.cr_priv == 1 {
                 cpu_state.cr_int_mask = data
             } else {
-                todo!("Handle exceptional state")
+                return Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         7 => {
             if cpu_state.cr_priv == 0 {
-                todo!("Handle exceptional state")
+                return Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         8 => {
             if cpu_state.cr_priv == 0 {
-                todo!("Handle exceptional state")
+                return Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         9 => {
             if cpu_state.cr_priv == 0 {
-                todo!("Handle exceptional state")
+                return Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         10 => {
             if cpu_state.cr_priv == 1 {
                 cpu_state.cr_int_scratch_0 = data
             } else {
-                todo!("Handle exceptional state")
+                return Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         11 => {
             if cpu_state.cr_priv == 1 {
                 cpu_state.cr_int_scratch_1 = data
             } else {
-                todo!("Handle exceptional state")
+                return Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         12 => {
@@ -1192,7 +1291,7 @@ fn write_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize, data: u6
             if cpu_state.cr_priv == 1 {
                 cpu_state.cr_int_ret_priv = (data & 1) as u8
             } else {
-                todo!("Handle exceptional state")
+                return Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         14 => {}
@@ -1200,27 +1299,27 @@ fn write_cr(cpu_state: &mut CPUState, cpu_info: &CPUInfo, index: usize, data: u6
             if cpu_state.cr_priv == 1 {
                 cpu_state.cr_no_cache_start = (data as usize) & !CACHE_LINE_SIZE.wrapping_sub(1)
             } else {
-                todo!("Handle exceptional state")
+                return Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         16 => {
             if cpu_state.cr_priv == 1 {
                 cpu_state.cr_no_cache_end = (data as usize) & !CACHE_LINE_SIZE.wrapping_sub(1)
             } else {
-                todo!("Handle exceptional state")
+                return Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         17 => {
             if cpu_state.cr_priv == 1 {
                 cpu_state.cr_address_mode = data as u8
             } else {
-                todo!("Handle exceptional state")
+                return Err(CPUError::ProtectedControlRegister(cpu_state.instruction_pointer, index))
             }
         }
         _ => {
             match cpu_info.undefined_behavior_mode {
                 UndefinedBehaviorMode::Relaxed => {} // drop writes to reserved control registers
-                UndefinedBehaviorMode::Strict => return Err(ReservedControlRegister(index)),
+                UndefinedBehaviorMode::Strict => return Err(CPUError::ReservedControlRegister(cpu_state.instruction_pointer, index)),
                 UndefinedBehaviorMode::Evil => {} // TODO I'm not sure what I want to do for writes to control registers that aren't in the specification
             }
         }
@@ -1239,13 +1338,17 @@ fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, instructi
     let absolute = first_byte & 4 != 0;
     let size = ValueSize::from_u8(first_byte & 3);
     if (size == ValueSize::DOUBLE && address_width < ValueSize::DOUBLE) || (size == ValueSize::QUAD && address_width < ValueSize::QUAD) {
-        todo!("Handle invalid size jump for address mode")
+        return Err(CPUError::IllegalInstruction(cpu_state.instruction_pointer, format!("Jump size {size:?} is not valid for address width {address_width:?}")));
     }
 
     let (immediate, read_bytes) = match size {
         ValueSize::HALF => {
             if instruction_data.len() < 2 {
-                todo!("General protection fault, not enough data")
+                return Err(CPUError::IncompleteInstruction {
+                    address: cpu_state.instruction_pointer,
+                    expected_size: 2,
+                    actual_size: instruction_data.len()
+                })
             }
             let value = if !absolute {
                 instruction_data[1] as usize | !(u8::MAX as usize)
@@ -1256,7 +1359,11 @@ fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, instructi
         }
         ValueSize::WORD => {
             if instruction_data.len() < 3 {
-                todo!("General protection fault, not enough data")
+                return Err(CPUError::IncompleteInstruction {
+                    address: cpu_state.instruction_pointer,
+                    expected_size: 3,
+                    actual_size: instruction_data.len()
+                })
             }
             let value = u16::from_le_bytes(instruction_data.as_slices().0[1..3].try_into().unwrap()) as usize;
             let value = if !absolute {
@@ -1268,7 +1375,11 @@ fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, instructi
         }
         ValueSize::DOUBLE => {
             if instruction_data.len() < 5 {
-                todo!("General protection fault, not enough data")
+                return Err(CPUError::IncompleteInstruction {
+                    address: cpu_state.instruction_pointer,
+                    expected_size: 5,
+                    actual_size: instruction_data.len()
+                })
             }
             let value = u32::from_le_bytes(instruction_data.as_slices().0[1..5].try_into().unwrap()) as usize;
             let value = if !absolute {
@@ -1280,7 +1391,11 @@ fn handle_exop_jump_call(cpu_state: &mut CPUState, cpu_info: &CPUInfo, instructi
         }
         ValueSize::QUAD => {
             if instruction_data.len() < 9 {
-                todo!("General protection fault, not enough data")
+                return Err(CPUError::IncompleteInstruction {
+                    address: cpu_state.instruction_pointer,
+                    expected_size: 9,
+                    actual_size: instruction_data.len()
+                })
             }
             let value = u64::from_le_bytes(instruction_data.as_slices().0[1..9].try_into().unwrap()) as usize;
             (value, 9)

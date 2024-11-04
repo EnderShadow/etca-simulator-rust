@@ -80,11 +80,8 @@ fn basic_addition_test() {
 
     for _ in 0..3 {
         let result = cpu_state.tick(&cpu_info, &mut memory);
-        match result {
-            Ok(new_cpu_state) => cpu_state = new_cpu_state,
-            Err(msg) => {
-                panic!("{}", msg);
-            }
+        if let Err(err) = result {
+            panic!("{}", err)
         }
     }
 
@@ -102,11 +99,8 @@ fn basic_addition_test2() {
 
     for _ in 0..2 {
         let result = cpu_state.tick(&cpu_info, &mut memory);
-        match result {
-            Ok(new_cpu_state) => cpu_state = new_cpu_state,
-            Err(msg) => {
-                panic!("{}", msg);
-            }
+        if let Err(err) = result {
+            panic!("{}", err)
         }
     }
 
